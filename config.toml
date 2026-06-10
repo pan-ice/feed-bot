@@ -1,0 +1,32 @@
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+[admin]
+admin_users = []
+
+[sign]
+base_points = 10
+consecutive_bonus = 5
+max_consecutive_bonus = 50
+
+[bot_attr]
+initial_satiety = 80.0
+initial_affection = 50.0
+satiety_decay_rate = 0.5
+affection_decay_rate = 0.1
+seek_feed_threshold = 30.0
+seek_feed_interval_hours = 4.0
+
+[filter]
+mode = "whitelist"
+group_list = []
+allow_private = true
+allow_group = true
+
+[llm]
+enabled = true
+model = ""
+temperature = 0.8
+max_tokens = 150
+fallback_reply = "谢谢你投喂我！好开心~"

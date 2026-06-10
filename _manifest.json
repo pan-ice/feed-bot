@@ -1,0 +1,36 @@
+{
+  "manifest_version": 2,
+  "id": "github.pan-ice.plugins-feed-bot",
+  "version": "1.0.0",
+  "name": "投喂插件",
+  "description": "签到积分+商店道具+投喂Bot+定时求投喂，支持全局/群内两层商店、管理员指令和黑白名单。",
+  "author": {
+    "name": "pan-ice",
+    "url": "https://github.com/pan-ice"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/pan-ice/plugins-feed-bot",
+    "homepage": "https://github.com/pan-ice/plugins-feed-bot",
+    "documentation": "https://github.com/pan-ice/plugins-feed-bot/blob/main/README.md",
+    "issues": "https://github.com/pan-ice/plugins-feed-bot/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text",
+    "llm.generate",
+    "chat.get_group_streams"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": ["zh-CN"]
+  }
+}
