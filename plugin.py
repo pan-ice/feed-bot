@@ -68,12 +68,10 @@ class BotAttrConfig(PluginConfigBase):
     __ui_icon__ = "heart"
     __ui_order__ = 3
 
+    satiety_scope: str = Field(default="global", description="饱食度范围：global（全局共享）或 per_group（群内独立）")
     initial_satiety: float = Field(default=80.0, description="初始饱食度（0-100）")
-    initial_affection: float = Field(default=50.0, description="初始好感度（0-100）")
     satiety_decay_rate: float = Field(default=0.5, description="饱食度每小时衰减量")
-    affection_decay_rate: float = Field(default=0.1, description="好感度每小时衰减量")
     seek_feed_threshold: float = Field(default=30.0, description="饱食度低于此值触发求投喂")
-    seek_feed_interval_hours: float = Field(default=4.0, description="求投喂最小间隔（小时）")
 
 
 class FilterConfig(PluginConfigBase):
@@ -97,10 +95,15 @@ class LLMConfig(PluginConfigBase):
     __ui_order__ = 5
 
     enabled: bool = Field(default=True, description="是否使用LLM生成投喂回复")
-    model: str = Field(default="", description="LLM模型名（空=默认模型）")
+    model: str = Field(default="replyer", description="LLM模型任务名（默认使用MaiBot的replyer模型）")
     temperature: float = Field(default=0.8, description="LLM温度（越高越随机）")
-    max_tokens: int = Field(default=150, description="LLM最大token数")
+    max_tokens: int = Field(default=300, description="LLM最大token数（含reasoning token）")
     fallback_reply: str = Field(default="谢谢你投喂我！好开心~", description="LLM不可用时的兜底回复")
+
+    @property
+    def effective_model(self) -> str:
+        """获取实际使用的模型任务名，空字符串时默认使用 replyer。"""
+        return self.model.strip() or "replyer"
 
 
 class FeedBotConfig(PluginConfigBase):
@@ -141,6 +144,7 @@ class FeedBotPlugin(MaiBotPlugin):
         self._db.execute("PRAGMA journal_mode=WAL")
         self._init_tables()
         self._init_bot_attributes()
+        self._migrate_per_group_data()
 
         self._running = True
         self._decay_task = asyncio.create_task(self._attr_decay_loop())
@@ -198,7 +202,6 @@ class FeedBotPlugin(MaiBotPlugin):
                 feed_reply_hint TEXT NOT NULL DEFAULT '',
                 category TEXT NOT NULL DEFAULT '',
                 satiety_bonus REAL NOT NULL DEFAULT 5.0,
-                affection_bonus REAL NOT NULL DEFAULT 2.0,
                 scope TEXT NOT NULL DEFAULT 'global',
                 group_id TEXT NOT NULL DEFAULT '',
                 is_on_sale INTEGER NOT NULL DEFAULT 1,
@@ -264,6 +267,7 @@ class FeedBotPlugin(MaiBotPlugin):
             CREATE TABLE IF NOT EXISTS feed_groups (
                 group_id TEXT PRIMARY KEY,
                 enabled INTEGER NOT NULL DEFAULT 1,
+                satiety REAL NOT NULL DEFAULT -1,
                 last_seek_feed_time REAL NOT NULL DEFAULT 0,
                 seek_feed_message TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL
@@ -287,7 +291,6 @@ class FeedBotPlugin(MaiBotPlugin):
         now = time.time()
         defaults = [
             ("satiety", self.config.bot_attr.initial_satiety, now),
-            ("affection", self.config.bot_attr.initial_affection, now),
         ]
         for attr_key, attr_value, ts in defaults:
             cursor = self._db.execute(
@@ -300,6 +303,99 @@ class FeedBotPlugin(MaiBotPlugin):
                     (attr_key, attr_value, ts),
                 )
         self._db.commit()
+
+    def _migrate_per_group_data(self) -> None:
+        """在 per_group 模式下，将旧的无群号前缀的用户数据迁移为带群号前缀的格式。"""
+        if self.config.bot_attr.satiety_scope != "per_group":
+            return
+        assert self._db is not None
+
+        # 收集所有群号
+        group_ids = set()
+        cursor = self._db.execute("SELECT group_id FROM feed_groups")
+        for row in cursor.fetchall():
+            if row[0]:
+                group_ids.add(row[0])
+        cursor = self._db.execute("SELECT DISTINCT group_id FROM feed_records WHERE group_id != ''")
+        for row in cursor.fetchall():
+            if row[0]:
+                group_ids.add(row[0])
+
+        if not group_ids:
+            return
+
+        migrated = False
+        for gid in group_ids:
+            prefix = f"{gid}:"
+            # 跳过已有前缀记录的群
+            cursor = self._db.execute(
+                "SELECT 1 FROM users WHERE user_id LIKE ? LIMIT 1",
+                (prefix + "%",),
+            )
+            if cursor.fetchone():
+                continue
+
+            # 从 feed_records 获取该群投喂过的旧用户（纯QQ号，无冒号前缀）
+            old_users = set()
+            cursor = self._db.execute(
+                "SELECT DISTINCT user_id FROM feed_records WHERE group_id = ? AND user_id NOT LIKE ?",
+                (gid, prefix + "%"),
+            )
+            for row in cursor.fetchall():
+                old_users.add(row[0])
+
+            for old_uid in old_users:
+                new_uid = f"{gid}:{old_uid}"
+                # 检查新记录是否已存在
+                cursor = self._db.execute(
+                    "SELECT 1 FROM users WHERE user_id = ?",
+                    (new_uid,),
+                )
+                if cursor.fetchone():
+                    continue
+
+                # 复制 users 记录（不改原记录，因为可能属于其他群）
+                cursor = self._db.execute(
+                    "SELECT nickname, points, total_sign_days, consecutive_sign_days, last_sign_time, total_feed_count, created_at FROM users WHERE user_id = ?",
+                    (old_uid,),
+                )
+                src = cursor.fetchone()
+                if src:
+                    self._db.execute(
+                        """
+                        INSERT OR IGNORE INTO users (user_id, nickname, points, total_sign_days,
+                                                      consecutive_sign_days, last_sign_time,
+                                                      total_feed_count, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (new_uid, src[0], src[1], src[2], src[3], src[4], src[5], src[6]),
+                    )
+
+                # 复制 user_inventory（只复制该群可见的道具）
+                cursor = self._db.execute(
+                    "SELECT item_id, quantity FROM user_inventory WHERE user_id = ?",
+                    (old_uid,),
+                )
+                for inv_row in cursor.fetchall():
+                    self._db.execute(
+                        """
+                        INSERT OR IGNORE INTO user_inventory (user_id, item_id, quantity)
+                        VALUES (?, ?, ?)
+                        """,
+                        (new_uid, inv_row[0], inv_row[1]),
+                    )
+
+                # 迁移 feed_records（只迁移该群的）
+                self._db.execute(
+                    "UPDATE feed_records SET user_id = ? WHERE user_id = ? AND group_id = ?",
+                    (new_uid, old_uid, gid),
+                )
+
+                migrated = True
+
+        if migrated:
+            self._db.commit()
+            self.ctx.logger.info("per_group 数据迁移完成")
 
     # ---- 权限与过滤 ----
 
@@ -338,12 +434,19 @@ class FeedBotPlugin(MaiBotPlugin):
 
     # ---- 内部方法 ----
 
-    def _ensure_user(self, user_id: str, nickname: str) -> None:
-        """确保用户存在于数据库中。"""
+    def _user_key(self, user_id: str, group_id: str = "") -> str:
+        """per_group 模式下返回 '群号:QQ号'，global 模式下返回原始 user_id。"""
+        if self.config.bot_attr.satiety_scope == "per_group" and group_id:
+            return f"{group_id}:{user_id}"
+        return user_id
+
+    def _ensure_user(self, user_id: str, nickname: str, group_id: str = "") -> None:
+        """确保用户存在于数据库中。per_group 模式下按群隔离。"""
+        uid = self._user_key(user_id, group_id)
         assert self._db is not None
         cursor = self._db.execute(
             "SELECT 1 FROM users WHERE user_id = ?",
-            (user_id,),
+            (uid,),
         )
         if cursor.fetchone() is None:
             self._db.execute(
@@ -353,43 +456,67 @@ class FeedBotPlugin(MaiBotPlugin):
                                    total_feed_count, created_at)
                 VALUES (?, ?, 0, 0, 0, 0, 0, ?)
                 """,
-                (user_id, nickname, time.time()),
+                (uid, nickname, time.time()),
             )
             self._db.commit()
         elif nickname:
             # 更新昵称
             self._db.execute(
                 "UPDATE users SET nickname = ? WHERE user_id = ? AND nickname != ?",
-                (nickname, user_id, nickname),
+                (nickname, uid, nickname),
             )
             self._db.commit()
 
-    def _get_attr(self, attr_key: str) -> float:
-        """获取 bot 属性值。"""
+    def _get_satiety(self, group_id: str = "") -> float:
+        """获取饱食度，根据配置自动选择全局或群内。如果群未初始化则自动创建记录。"""
         assert self._db is not None
-        cursor = self._db.execute(
-            "SELECT attr_value FROM bot_attributes WHERE attr_key = ?",
-            (attr_key,),
-        )
-        row = cursor.fetchone()
-        return float(row[0]) if row else 0.0
+        if self.config.bot_attr.satiety_scope == "per_group" and group_id:
+            cursor = self._db.execute(
+                "SELECT satiety FROM feed_groups WHERE group_id = ?",
+                (group_id,),
+            )
+            row = cursor.fetchone()
+            if row is not None and row[0] >= 0:
+                return float(row[0])
+            # 群未初始化饱食度，自动创建记录并写入初始值
+            initial = self.config.bot_attr.initial_satiety
+            self._db.execute(
+                """
+                INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, created_at)
+                VALUES (?, 1, ?, 0, ?)
+                ON CONFLICT(group_id) DO UPDATE SET satiety = ?
+                """,
+                (group_id, initial, time.time(), initial),
+            )
+            self._db.commit()
+            return initial
+        else:
+            cursor = self._db.execute(
+                "SELECT attr_value FROM bot_attributes WHERE attr_key = 'satiety'",
+            )
+            row = cursor.fetchone()
+            return float(row[0]) if row else 0.0
 
-    def _set_attr(self, attr_key: str, value: float) -> None:
-        """设置 bot 属性值（钳位到 0-100）。"""
+    def _set_satiety(self, value: float, group_id: str = "") -> None:
+        """设置饱食度（钳位到 0-100），根据配置自动选择全局或群内。"""
         assert self._db is not None
         value = max(0.0, min(100.0, value))
-        self._db.execute(
-            "UPDATE bot_attributes SET attr_value = ?, last_update_time = ? WHERE attr_key = ?",
-            (value, time.time(), attr_key),
-        )
-        self._db.commit()
-
-    def _add_attr(self, attr_key: str, delta: float) -> float:
-        """增减 bot 属性值，返回更新后的值。"""
-        current = self._get_attr(attr_key)
-        new_value = max(0.0, min(100.0, current + delta))
-        self._set_attr(attr_key, new_value)
-        return new_value
+        if self.config.bot_attr.satiety_scope == "per_group" and group_id:
+            self._db.execute(
+                """
+                INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, created_at)
+                VALUES (?, 1, ?, 0, ?)
+                ON CONFLICT(group_id) DO UPDATE SET satiety = ?
+                """,
+                (group_id, value, time.time(), value),
+            )
+            self._db.commit()
+        else:
+            self._db.execute(
+                "UPDATE bot_attributes SET attr_value = ?, last_update_time = ? WHERE attr_key = 'satiety'",
+                (value, time.time()),
+            )
+            self._db.commit()
 
     def _find_shop_item(self, item_name: str, group_id: str) -> dict[str, Any] | None:
         """查找道具：优先本群专属，其次全局。"""
@@ -400,7 +527,7 @@ class FeedBotPlugin(MaiBotPlugin):
             cursor = self._db.execute(
                 """
                 SELECT item_id, name, emoji, description, price, feed_reply_hint,
-                       category, satiety_bonus, affection_bonus, scope, group_id
+                       category, satiety_bonus, scope, group_id
                 FROM shop_items
                 WHERE name = ? AND scope = 'group' AND group_id = ? AND is_on_sale = 1
                 """,
@@ -414,7 +541,7 @@ class FeedBotPlugin(MaiBotPlugin):
         cursor = self._db.execute(
             """
             SELECT item_id, name, emoji, description, price, feed_reply_hint,
-                   category, satiety_bonus, affection_bonus, scope, group_id
+                   category, satiety_bonus, scope, group_id
             FROM shop_items
             WHERE name = ? AND scope = 'global' AND is_on_sale = 1
             """,
@@ -438,9 +565,8 @@ class FeedBotPlugin(MaiBotPlugin):
             "feed_reply_hint": row[5],
             "category": row[6],
             "satiety_bonus": row[7],
-            "affection_bonus": row[8],
-            "scope": row[9],
-            "group_id": row[10],
+            "scope": row[8],
+            "group_id": row[9],
         }
 
     # ---- 签到命令 ----
@@ -466,15 +592,16 @@ class FeedBotPlugin(MaiBotPlugin):
 
         # 提取昵称
         nickname = _extract_nickname(message)
-        self._ensure_user(user_id, nickname)
+        self._ensure_user(user_id, nickname, group_id)
 
         assert self._db is not None
+        uid = self._user_key(user_id, group_id)
 
         # 检查今天是否已签到
         now = time.time()
         cursor = self._db.execute(
             "SELECT last_sign_time, consecutive_sign_days, total_sign_days FROM users WHERE user_id = ?",
-            (user_id,),
+            (uid,),
         )
         row = cursor.fetchone()
         if not row:
@@ -516,7 +643,7 @@ class FeedBotPlugin(MaiBotPlugin):
                              consecutive_sign_days = ?, last_sign_time = ?
             WHERE user_id = ?
             """,
-            (earned, total_days, consecutive_days, now, user_id),
+            (earned, total_days, consecutive_days, now, uid),
         )
         self._db.commit()
 
@@ -558,12 +685,13 @@ class FeedBotPlugin(MaiBotPlugin):
             return False, "无权限", True
 
         nickname = _extract_nickname(message)
-        self._ensure_user(user_id, nickname)
+        self._ensure_user(user_id, nickname, group_id)
 
         assert self._db is not None
+        uid = self._user_key(user_id, group_id)
         cursor = self._db.execute(
             "SELECT points, total_sign_days, consecutive_sign_days FROM users WHERE user_id = ?",
-            (user_id,),
+            (uid,),
         )
         row = cursor.fetchone()
         if not row:
@@ -600,14 +728,26 @@ class FeedBotPlugin(MaiBotPlugin):
             return False, "无权限", True
 
         assert self._db is not None
-        cursor = self._db.execute(
-            """
-            SELECT nickname, user_id, points
-            FROM users
-            WHERE points > 0
-            ORDER BY points DESC LIMIT 10
-            """
-        )
+        if self.config.bot_attr.satiety_scope == "per_group":
+            prefix = f"{group_id}:"
+            cursor = self._db.execute(
+                """
+                SELECT nickname, user_id, points
+                FROM users
+                WHERE user_id LIKE ? AND points > 0
+                ORDER BY points DESC LIMIT 10
+                """,
+                (prefix + "%",),
+            )
+        else:
+            cursor = self._db.execute(
+                """
+                SELECT nickname, user_id, points
+                FROM users
+                WHERE points > 0
+                ORDER BY points DESC LIMIT 10
+                """
+            )
         rows = cursor.fetchall()
 
         if not rows:
@@ -616,7 +756,9 @@ class FeedBotPlugin(MaiBotPlugin):
 
         lines = ["🏆 积分排行榜"]
         for i, (nickname, uid, pts) in enumerate(rows, 1):
-            display_name = nickname or uid
+            # per_group 模式下去掉群号前缀
+            display_uid = uid.split(":", 1)[-1] if ":" in uid else uid
+            display_name = nickname or display_uid
             lines.append(f"  {i}. {display_name} — {pts}积分")
 
         await self.ctx.send.text("\n".join(lines), stream_id)
@@ -647,7 +789,7 @@ class FeedBotPlugin(MaiBotPlugin):
         # 查询全局道具
         global_cursor = self._db.execute(
             """
-            SELECT name, emoji, price, description, category
+            SELECT name, emoji, price, description, category, satiety_bonus
             FROM shop_items
             WHERE scope = 'global' AND is_on_sale = 1
             ORDER BY price ASC
@@ -660,7 +802,7 @@ class FeedBotPlugin(MaiBotPlugin):
         if group_id:
             group_cursor = self._db.execute(
                 """
-                SELECT name, emoji, price, description, category
+                SELECT name, emoji, price, description, category, satiety_bonus
                 FROM shop_items
                 WHERE scope = 'group' AND group_id = ? AND is_on_sale = 1
                 ORDER BY price ASC
@@ -677,18 +819,18 @@ class FeedBotPlugin(MaiBotPlugin):
 
         if global_items:
             lines.append("🌐 全局道具")
-            for name, emoji, price, desc, _cat in global_items:
+            for name, emoji, price, desc, _cat, satiety_bonus in global_items:
                 display = f"{emoji}{name}" if emoji else name
                 desc_part = f" — {desc}" if desc else ""
-                lines.append(f"  {display} {price}积分{desc_part}")
+                lines.append(f"  {display} {price}积分 饱食度{satiety_bonus:+}{desc_part}")
 
         if group_items:
             lines.append("")
             lines.append("🏠 本群专属")
-            for name, emoji, price, desc, _cat in group_items:
+            for name, emoji, price, desc, _cat, satiety_bonus in group_items:
                 display = f"{emoji}{name}" if emoji else name
                 desc_part = f" — {desc}" if desc else ""
-                lines.append(f"  {display} {price}积分{desc_part}")
+                lines.append(f"  {display} {price}积分 饱食度{satiety_bonus:+}{desc_part}")
 
         lines.append("")
         lines.append("💡 使用 /购买 <道具名> 购买道具")
@@ -723,9 +865,10 @@ class FeedBotPlugin(MaiBotPlugin):
             return False, "缺少道具名", True
 
         nickname = _extract_nickname(message)
-        self._ensure_user(user_id, nickname)
+        self._ensure_user(user_id, nickname, group_id)
 
         assert self._db is not None
+        uid = self._user_key(user_id, group_id)
 
         # 查找道具
         item = self._find_shop_item(item_name, group_id)
@@ -736,7 +879,7 @@ class FeedBotPlugin(MaiBotPlugin):
         # 检查积分
         cursor = self._db.execute(
             "SELECT points FROM users WHERE user_id = ?",
-            (user_id,),
+            (uid,),
         )
         row = cursor.fetchone()
         if not row:
@@ -753,7 +896,7 @@ class FeedBotPlugin(MaiBotPlugin):
         # 扣减积分，增加背包
         self._db.execute(
             "UPDATE users SET points = points - ? WHERE user_id = ?",
-            (item["price"], user_id),
+            (item["price"], uid),
         )
         self._db.execute(
             """
@@ -761,7 +904,7 @@ class FeedBotPlugin(MaiBotPlugin):
             VALUES (?, ?, 1)
             ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + 1
             """,
-            (user_id, item["item_id"]),
+            (uid, item["item_id"]),
         )
         self._db.commit()
 
@@ -793,15 +936,16 @@ class FeedBotPlugin(MaiBotPlugin):
             return False, "无权限", True
 
         assert self._db is not None
+        uid = self._user_key(user_id, group_id)
         cursor = self._db.execute(
             """
-            SELECT si.name, si.emoji, inv.quantity
+            SELECT si.name, si.emoji, si.satiety_bonus, inv.quantity
             FROM user_inventory inv
             JOIN shop_items si ON inv.item_id = si.item_id
             WHERE inv.user_id = ? AND inv.quantity > 0
             ORDER BY si.name ASC
             """,
-            (user_id,),
+            (uid,),
         )
         rows = cursor.fetchall()
 
@@ -810,9 +954,9 @@ class FeedBotPlugin(MaiBotPlugin):
             return True, "背包为空", True
 
         lines = ["🎒 你的背包"]
-        for name, emoji, qty in rows:
+        for name, emoji, satiety_bonus, qty in rows:
             display = f"{emoji}{name}" if emoji else name
-            lines.append(f"  {display} x{qty}")
+            lines.append(f"  {display} x{qty} 饱食度{satiety_bonus:+}")
         lines.append("")
         lines.append("💡 使用 /投喂 <道具名> 投喂我吧～")
 
@@ -847,20 +991,21 @@ class FeedBotPlugin(MaiBotPlugin):
             return False, "缺少道具名", True
 
         nickname = _extract_nickname(message)
-        self._ensure_user(user_id, nickname)
+        self._ensure_user(user_id, nickname, group_id)
 
         assert self._db is not None
+        uid = self._user_key(user_id, group_id)
 
         # 查找背包中的道具
         cursor = self._db.execute(
             """
             SELECT inv.item_id, inv.quantity, si.name, si.emoji, si.feed_reply_hint,
-                   si.satiety_bonus, si.affection_bonus
+                   si.satiety_bonus
             FROM user_inventory inv
             JOIN shop_items si ON inv.item_id = si.item_id
             WHERE inv.user_id = ? AND si.name = ? AND inv.quantity > 0
             """,
-            (user_id, item_name),
+            (uid, item_name),
         )
         row = cursor.fetchone()
 
@@ -870,27 +1015,33 @@ class FeedBotPlugin(MaiBotPlugin):
             )
             return False, "背包无此道具", True
 
-        item_id, _qty, name, emoji, reply_hint, satiety_bonus, affection_bonus = row
+        item_id, _qty, name, emoji, reply_hint, satiety_bonus = row
+
+        # 检查饱食度是否已满
+        current_satiety = self._get_satiety(group_id)
+        if current_satiety >= 100:
+            await self.ctx.send.text("我已经吃饱了，吃不下啦～等饿一点再喂我吧！", stream_id)
+            return False, "饱食度已满", True
 
         # 扣减背包
         self._db.execute(
             "UPDATE user_inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_id = ?",
-            (user_id, item_id),
+            (uid, item_id),
         )
         # 清理数量为0的记录
         self._db.execute(
             "DELETE FROM user_inventory WHERE user_id = ? AND item_id = ? AND quantity <= 0",
-            (user_id, item_id),
+            (uid, item_id),
         )
 
-        # 增加 bot 属性
-        new_satiety = self._add_attr("satiety", satiety_bonus)
-        new_affection = self._add_attr("affection", affection_bonus)
+        # 增加 bot 饱食度（不超过100）
+        new_satiety = min(100.0, current_satiety + satiety_bonus)
+        self._set_satiety(new_satiety, group_id)
 
         # 更新用户投喂计数
         self._db.execute(
             "UPDATE users SET total_feed_count = total_feed_count + 1 WHERE user_id = ?",
-            (user_id,),
+            (uid,),
         )
 
         # 获取最近投喂记录（用于 LLM 生成）
@@ -898,8 +1049,10 @@ class FeedBotPlugin(MaiBotPlugin):
             """
             SELECT item_name, item_emoji, reply_text
             FROM feed_records
+            WHERE user_id = ?
             ORDER BY created_at DESC LIMIT 3
-            """
+            """,
+            (uid,),
         )
         recent_feeds = recent_cursor.fetchall()
 
@@ -910,7 +1063,6 @@ class FeedBotPlugin(MaiBotPlugin):
             item_emoji=emoji,
             feed_reply_hint=reply_hint,
             satiety=new_satiety,
-            affection=new_affection,
             recent_feeds=recent_feeds,
         )
 
@@ -922,14 +1074,15 @@ class FeedBotPlugin(MaiBotPlugin):
                                        item_name, item_emoji, reply_text, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, nickname, group_id, item_id, name, emoji, reply, now),
+            (uid, nickname, group_id, item_id, name, emoji, reply, now),
         )
         self._db.commit()
 
         # 发送回复
         display_item = f"{emoji}{name}" if emoji else name
+        satiety_change = new_satiety - current_satiety
         await self.ctx.send.text(
-            f"{nickname} 投喂了 {display_item} 给我～\n{reply}",
+            f"{nickname} 投喂了 {display_item} 给我～饱食度 +{satiety_change:.0f}（{new_satiety:.0f}/100）\n{reply}",
             stream_id,
         )
         return True, f"投喂{name}", True
@@ -953,6 +1106,7 @@ class FeedBotPlugin(MaiBotPlugin):
             return False, "无权限", True
 
         assert self._db is not None
+        uid = self._user_key(user_id, group_id)
         cursor = self._db.execute(
             """
             SELECT item_name, item_emoji, reply_text, created_at
@@ -960,7 +1114,7 @@ class FeedBotPlugin(MaiBotPlugin):
             WHERE user_id = ?
             ORDER BY created_at DESC LIMIT 10
             """,
-            (user_id,),
+            (uid,),
         )
         rows = cursor.fetchall()
 
@@ -981,15 +1135,15 @@ class FeedBotPlugin(MaiBotPlugin):
         await self.ctx.send.text("\n".join(lines), stream_id)
         return True, "投喂记录", True
 
-    @Command("bot_status", description="查看Bot状态", pattern=r"^/bot状态$")
-    async def handle_bot_status(
+    @Command("satiety_status", description="查看当前饱食度", pattern=r"^/饱食度$")
+    async def handle_satiety_status(
         self,
         stream_id: str = "",
         user_id: str = "",
         group_id: str = "",
         **kwargs: Any,
     ) -> tuple[bool, str, bool]:
-        """处理 /bot状态 命令。"""
+        """处理 /饱食度 命令。"""
         del kwargs
 
         if not user_id:
@@ -999,36 +1153,22 @@ class FeedBotPlugin(MaiBotPlugin):
         if not self._check_permission(group_id, user_id, is_group):
             return False, "无权限", True
 
-        satiety = self._get_attr("satiety")
-        affection = self._get_attr("affection")
+        satiety = self._get_satiety(group_id)
 
         # 根据饱食度生成状态描述
         if satiety >= 80:
-            satiety_desc = "饱饱的～好满足"
+            desc = "饱饱的～好满足"
         elif satiety >= 50:
-            satiety_desc = "还行，不太饿"
+            desc = "还行，不太饿"
         elif satiety >= 30:
-            satiety_desc = "有点饿了..."
+            desc = "有点饿了..."
         else:
-            satiety_desc = "好饿好饿！快投喂我！"
+            desc = "好饿好饿！快投喂我！"
 
-        # 根据好感度生成状态描述
-        if affection >= 80:
-            affection_desc = "超喜欢你！"
-        elif affection >= 50:
-            affection_desc = "我们关系不错呢"
-        elif affection >= 30:
-            affection_desc = "还在熟悉中..."
-        else:
-            affection_desc = "有点陌生..."
-
-        msg = (
-            f"📊 我的状态\n"
-            f"  🍖 饱食度：{satiety:.0f}/100 — {satiety_desc}\n"
-            f"  💕 好感度：{affection:.0f}/100 — {affection_desc}"
-        )
+        scope_hint = "（本群）" if self.config.bot_attr.satiety_scope == "per_group" and group_id else ""
+        msg = f"🍖 当前饱食度{scope_hint}：{satiety:.0f}/100 — {desc}"
         await self.ctx.send.text(msg, stream_id)
-        return True, "Bot状态", True
+        return True, "饱食度", True
 
     @Command("feed_ranking", description="查看本群投喂排行", pattern=r"^/投喂排行$")
     async def handle_feed_ranking(
@@ -1049,14 +1189,26 @@ class FeedBotPlugin(MaiBotPlugin):
             return False, "无权限", True
 
         assert self._db is not None
-        cursor = self._db.execute(
-            """
-            SELECT u.nickname, u.user_id, u.total_feed_count
-            FROM users u
-            WHERE u.total_feed_count > 0
-            ORDER BY u.total_feed_count DESC LIMIT 10
-            """
-        )
+        if self.config.bot_attr.satiety_scope == "per_group":
+            prefix = f"{group_id}:"
+            cursor = self._db.execute(
+                """
+                SELECT u.nickname, u.user_id, u.total_feed_count
+                FROM users u
+                WHERE u.user_id LIKE ? AND u.total_feed_count > 0
+                ORDER BY u.total_feed_count DESC LIMIT 10
+                """,
+                (prefix + "%",),
+            )
+        else:
+            cursor = self._db.execute(
+                """
+                SELECT u.nickname, u.user_id, u.total_feed_count
+                FROM users u
+                WHERE u.total_feed_count > 0
+                ORDER BY u.total_feed_count DESC LIMIT 10
+                """
+            )
         rows = cursor.fetchall()
 
         if not rows:
@@ -1065,7 +1217,8 @@ class FeedBotPlugin(MaiBotPlugin):
 
         lines = ["🏆 投喂排行榜"]
         for i, (nickname, uid, count) in enumerate(rows, 1):
-            display_name = nickname or uid
+            display_uid = uid.split(":", 1)[-1] if ":" in uid else uid
+            display_name = nickname or display_uid
             lines.append(f"  {i}. {display_name} — 投喂{count}次")
 
         await self.ctx.send.text("\n".join(lines), stream_id)
@@ -1076,15 +1229,19 @@ class FeedBotPlugin(MaiBotPlugin):
     @Command(
         "admin_global_add_item",
         description="上架全局道具（Bot管理员）",
-        pattern=r"^/投喂管理\s+全局上架\s+(?P<name>\S+)\s+(?P<price>\d+)(?:\s+(?P<emoji>\S+))?(?:\s+(?P<desc>.+))?$",
+        pattern=r"^/投喂管理\s+全局上架\s+(?P<name>\S+)\s+(?P<price>\d+)(?:\s+(?P<rest>.+))?$",
     )
     async def handle_admin_global_add_item(
         self,
         stream_id: str = "",
         user_id: str = "",
+        group_id: str = "",
         **kwargs: Any,
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 全局上架 命令。"""
+        if group_id:
+            await self.ctx.send.text("Bot管理员命令请私聊Bot使用", stream_id)
+            return False, "非私聊", True
         if not self._is_bot_admin(user_id):
             await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
             return False, "非管理员", True
@@ -1095,11 +1252,10 @@ class FeedBotPlugin(MaiBotPlugin):
 
         name = str(matched_groups.get("name") or "").strip()
         price_str = str(matched_groups.get("price") or "").strip()
-        emoji = str(matched_groups.get("emoji") or "").strip()
-        desc = str(matched_groups.get("desc") or "").strip()
+        rest = str(matched_groups.get("rest") or "").strip()
 
         if not name or not price_str:
-            await self.ctx.send.text("用法：/投喂管理 全局上架 <名称> <价格> [emoji] [描述]", stream_id)
+            await self.ctx.send.text("用法：/投喂管理 全局上架 <名称> <价格> [emoji] [描述] [饱食度N]", stream_id)
             return False, "参数缺失", True
 
         try:
@@ -1107,6 +1263,27 @@ class FeedBotPlugin(MaiBotPlugin):
         except ValueError:
             await self.ctx.send.text("价格必须是整数", stream_id)
             return False, "价格格式错误", True
+
+        # 从剩余文本中提取饱食度和描述
+        satiety_bonus = 5.0
+        emoji = ""
+        desc = ""
+        if rest:
+            import re as _re
+            satiety_match = _re.search(r"饱食度(-?\d+(?:\.\d+)?)", rest)
+            if satiety_match:
+                satiety_bonus = float(satiety_match.group(1))
+                rest = rest[:satiety_match.start()] + rest[satiety_match.end():]
+                rest = rest.strip()
+            if rest:
+                tokens = rest.split(None, 1)
+                # 判断第一个token是否为emoji（非ASCII字符且长度短）
+                first = tokens[0]
+                if len(first) <= 2 and not first.isascii():
+                    emoji = first
+                    desc = tokens[1].strip() if len(tokens) > 1 else ""
+                else:
+                    desc = rest
 
         assert self._db is not None
 
@@ -1122,16 +1299,16 @@ class FeedBotPlugin(MaiBotPlugin):
         self._db.execute(
             """
             INSERT INTO shop_items (name, emoji, description, price, scope, group_id,
-                                     is_on_sale, created_by, created_at)
-            VALUES (?, ?, ?, ?, 'global', '', 1, ?, ?)
+                                     is_on_sale, satiety_bonus, created_by, created_at)
+            VALUES (?, ?, ?, ?, 'global', '', 1, ?, ?, ?)
             """,
-            (name, emoji, desc, price, user_id, time.time()),
+            (name, emoji, desc, price, satiety_bonus, user_id, time.time()),
         )
         self._db.commit()
 
         display = f"{emoji}{name}" if emoji else name
         await self.ctx.send.text(
-            f"✅ 全局道具「{display}」已上架，价格：{price}积分", stream_id
+            f"✅ 全局道具「{display}」已上架，价格：{price}积分，饱食度{satiety_bonus:+}", stream_id
         )
         return True, f"上架全局道具{name}", True
 
@@ -1144,9 +1321,13 @@ class FeedBotPlugin(MaiBotPlugin):
         self,
         stream_id: str = "",
         user_id: str = "",
+        group_id: str = "",
         **kwargs: Any,
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 全局下架 命令。"""
+        if group_id:
+            await self.ctx.send.text("Bot管理员命令请私聊Bot使用", stream_id)
+            return False, "非私聊", True
         if not self._is_bot_admin(user_id):
             await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
             return False, "非管理员", True
@@ -1173,18 +1354,80 @@ class FeedBotPlugin(MaiBotPlugin):
         return True, f"下架全局道具{item_name}", True
 
     @Command(
+        "admin_modify_satiety",
+        description="修改道具饱食度（管理员）",
+        pattern=r"^/投喂管理\s+修改饱食度\s+(?P<item_name>.+?)\s+(?P<satiety>-?\d+(?:\.\d+)?)$",
+    )
+    async def handle_admin_modify_satiety(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /投喂管理 修改饱食度 命令。"""
+        if group_id:
+            if self.config.bot_attr.satiety_scope != "per_group":
+                await self.ctx.send.text("全局模式下群管理员不可使用此命令，请联系Bot管理员", stream_id)
+                return False, "全局模式限制", True
+            if not self._is_group_admin(group_id, user_id):
+                await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
+                return False, "非管理员", True
+        elif not self._is_bot_admin(user_id):
+            await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
+            return False, "非管理员", True
+
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+
+        item_name = str(matched_groups.get("item_name") or "").strip()
+        satiety_str = str(matched_groups.get("satiety") or "").strip()
+
+        if not item_name or not satiety_str:
+            await self.ctx.send.text("用法：/投喂管理 修改饱食度 <道具名> <饱食度>", stream_id)
+            return False, "参数缺失", True
+
+        try:
+            satiety_bonus = float(satiety_str)
+        except ValueError:
+            await self.ctx.send.text("饱食度必须是数字", stream_id)
+            return False, "饱食度格式错误", True
+
+        assert self._db is not None
+        cursor = self._db.execute(
+            "UPDATE shop_items SET satiety_bonus = ? WHERE name = ? AND is_on_sale = 1",
+            (satiety_bonus, item_name),
+        )
+        if cursor.rowcount == 0:
+            await self.ctx.send.text(f"未找到在售道具「{item_name}」", stream_id)
+            return False, "道具不存在", True
+        self._db.commit()
+
+        await self.ctx.send.text(f"✅ 道具「{item_name}」饱食度已修改为{satiety_bonus:+}", stream_id)
+        return True, f"修改道具饱食度{item_name}", True
+
+    @Command(
         "admin_points",
-        description="调整用户积分（Bot管理员）",
-        pattern=r"^/投喂管理\s+积分\s+(?P<target_user>\S+)\s+(?P<amount>-?\d+)$",
+        description="调整用户积分（管理员）",
+        pattern=r"^/投喂管理\s+积分\s+(?P<target_user>\S+)\s+(?P<amount>-?\d+)(?:\s+(?P<target_group>\S+))?$",
     )
     async def handle_admin_points(
         self,
         stream_id: str = "",
         user_id: str = "",
+        group_id: str = "",
         **kwargs: Any,
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 积分 命令。"""
-        if not self._is_bot_admin(user_id):
+        if group_id:
+            if self.config.bot_attr.satiety_scope != "per_group":
+                await self.ctx.send.text("全局模式下群管理员不可使用此命令，请联系Bot管理员", stream_id)
+                return False, "全局模式限制", True
+            if not self._is_group_admin(group_id, user_id):
+                await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
+                return False, "非管理员", True
+        elif not self._is_bot_admin(user_id):
             await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
             return False, "非管理员", True
 
@@ -1194,10 +1437,17 @@ class FeedBotPlugin(MaiBotPlugin):
 
         target_user = str(matched_groups.get("target_user") or "").strip()
         amount_str = str(matched_groups.get("amount") or "").strip()
+        target_group = str(matched_groups.get("target_group") or "").strip()
 
         if not target_user or not amount_str:
-            await self.ctx.send.text("用法：/投喂管理 积分 <QQ号> <数量>", stream_id)
+            await self.ctx.send.text("用法：/投喂管理 积分 <QQ号> <数量> [群号]", stream_id)
             return False, "参数缺失", True
+
+        # per_group 模式下确定目标群号
+        effective_group = target_group or group_id
+        if self.config.bot_attr.satiety_scope == "per_group" and not effective_group:
+            await self.ctx.send.text("分群模式下需要指定群号：/投喂管理 积分 <QQ号> <数量> <群号>", stream_id)
+            return False, "缺少群号", True
 
         try:
             amount = int(amount_str)
@@ -1208,11 +1458,12 @@ class FeedBotPlugin(MaiBotPlugin):
         assert self._db is not None
 
         # 确保目标用户存在
-        self._ensure_user(target_user, "")
+        uid = self._user_key(target_user, effective_group)
+        self._ensure_user(target_user, "", effective_group)
 
         self._db.execute(
             "UPDATE users SET points = MAX(0, points + ?) WHERE user_id = ?",
-            (amount, target_user),
+            (amount, uid),
         )
         self._db.commit()
 
@@ -1224,17 +1475,25 @@ class FeedBotPlugin(MaiBotPlugin):
 
     @Command(
         "admin_attr",
-        description="设置Bot属性（Bot管理员）",
+        description="设置Bot属性（管理员）",
         pattern=r"^/投喂管理\s+属性\s+(?P<attr_key>\S+)\s+(?P<attr_value>\d+\.?\d*)$",
     )
     async def handle_admin_attr(
         self,
         stream_id: str = "",
         user_id: str = "",
+        group_id: str = "",
         **kwargs: Any,
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 属性 命令。"""
-        if not self._is_bot_admin(user_id):
+        if group_id:
+            if self.config.bot_attr.satiety_scope != "per_group":
+                await self.ctx.send.text("全局模式下群管理员不可使用此命令，请联系Bot管理员", stream_id)
+                return False, "全局模式限制", True
+            if not self._is_group_admin(group_id, user_id):
+                await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
+                return False, "非管理员", True
+        elif not self._is_bot_admin(user_id):
             await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
             return False, "非管理员", True
 
@@ -1246,12 +1505,11 @@ class FeedBotPlugin(MaiBotPlugin):
         attr_value_str = str(matched_groups.get("attr_value") or "").strip()
 
         if not attr_key or not attr_value_str:
-            await self.ctx.send.text("用法：/投喂管理 属性 <属性名> <值>（属性名：satiety/affection）", stream_id)
+            await self.ctx.send.text("用法：/投喂管理 属性 satiety <值>", stream_id)
             return False, "参数缺失", True
 
-        valid_keys = {"satiety", "affection"}
-        if attr_key not in valid_keys:
-            await self.ctx.send.text(f"无效属性名，可选：{', '.join(valid_keys)}", stream_id)
+        if attr_key != "satiety":
+            await self.ctx.send.text("无效属性名，当前仅支持：satiety", stream_id)
             return False, "无效属性名", True
 
         try:
@@ -1260,11 +1518,10 @@ class FeedBotPlugin(MaiBotPlugin):
             await self.ctx.send.text("属性值必须是数字", stream_id)
             return False, "属性值格式错误", True
 
-        self._set_attr(attr_key, attr_value)
+        self._set_satiety(attr_value, group_id)
 
-        key_names = {"satiety": "饱食度", "affection": "好感度"}
         await self.ctx.send.text(
-            f"✅ {key_names.get(attr_key, attr_key)}已设置为 {attr_value:.0f}", stream_id
+            f"✅ 饱食度已设置为 {attr_value:.0f}", stream_id
         )
         return True, f"设置属性{attr_key}", True
 
@@ -1277,9 +1534,13 @@ class FeedBotPlugin(MaiBotPlugin):
         self,
         stream_id: str = "",
         user_id: str = "",
+        group_id: str = "",
         **kwargs: Any,
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 求喂 命令。"""
+        if group_id:
+            await self.ctx.send.text("Bot管理员命令请私聊Bot使用", stream_id)
+            return False, "非私聊", True
         if not self._is_bot_admin(user_id):
             await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
             return False, "非管理员", True
@@ -1318,36 +1579,53 @@ class FeedBotPlugin(MaiBotPlugin):
 
     @Command(
         "admin_reset_sign",
-        description="重置用户签到（Bot管理员）",
-        pattern=r"^/投喂管理\s+重置签到\s+(?P<target_user>\S+)$",
+        description="重置用户签到（管理员）",
+        pattern=r"^/投喂管理\s+重置签到\s+(?P<target_user>\S+)(?:\s+(?P<target_group>\S+))?$",
     )
     async def handle_admin_reset_sign(
         self,
         stream_id: str = "",
         user_id: str = "",
+        group_id: str = "",
         **kwargs: Any,
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 重置签到 命令。"""
-        if not self._is_bot_admin(user_id):
+        if group_id:
+            if self.config.bot_attr.satiety_scope != "per_group":
+                await self.ctx.send.text("全局模式下群管理员不可使用此命令，请联系Bot管理员", stream_id)
+                return False, "全局模式限制", True
+            if not self._is_group_admin(group_id, user_id):
+                await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
+                return False, "非管理员", True
+        elif not self._is_bot_admin(user_id):
             await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
             return False, "非管理员", True
 
         matched_groups = kwargs.get("matched_groups")
         if not isinstance(matched_groups, dict):
             matched_groups = {}
+
         target_user = str(matched_groups.get("target_user") or "").strip()
+        target_group = str(matched_groups.get("target_group") or "").strip()
 
         if not target_user:
-            await self.ctx.send.text("用法：/投喂管理 重置签到 <QQ号>", stream_id)
+            await self.ctx.send.text("用法：/投喂管理 重置签到 <QQ号> [群号]", stream_id)
             return False, "参数缺失", True
 
+        # per_group 模式下确定目标群号
+        effective_group = target_group or group_id
+        if self.config.bot_attr.satiety_scope == "per_group" and not effective_group:
+            await self.ctx.send.text("分群模式下需要指定群号：/投喂管理 重置签到 <QQ号> <群号>", stream_id)
+            return False, "缺少群号", True
+
         assert self._db is not None
+        uid = self._user_key(target_user, effective_group)
         self._db.execute(
             """
             UPDATE users SET total_sign_days = 0, consecutive_sign_days = 0, last_sign_time = 0
             WHERE user_id = ?
             """,
-            (target_user,),
+            (uid,),
         )
         self._db.commit()
 
@@ -1356,17 +1634,25 @@ class FeedBotPlugin(MaiBotPlugin):
 
     @Command(
         "admin_grant",
-        description="授权群管理员（Bot管理员）",
+        description="授权群管理员（管理员）",
         pattern=r"^/投喂管理\s+授权\s+(?P<group_id>\S+)\s+(?P<target_user>\S+)$",
     )
     async def handle_admin_grant(
         self,
         stream_id: str = "",
         user_id: str = "",
+        group_id: str = "",
         **kwargs: Any,
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 授权 命令。"""
-        if not self._is_bot_admin(user_id):
+        if group_id:
+            if self.config.bot_attr.satiety_scope != "per_group":
+                await self.ctx.send.text("全局模式下群管理员不可使用此命令，请联系Bot管理员", stream_id)
+                return False, "全局模式限制", True
+            if not self._is_group_admin(group_id, user_id):
+                await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
+                return False, "非管理员", True
+        elif not self._is_bot_admin(user_id):
             await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
             return False, "非管理员", True
 
@@ -1380,6 +1666,11 @@ class FeedBotPlugin(MaiBotPlugin):
         if not target_group_id or not target_user:
             await self.ctx.send.text("用法：/投喂管理 授权 <群号> <QQ号>", stream_id)
             return False, "参数缺失", True
+
+        # 群聊中只能授权当前群
+        if group_id and target_group_id != group_id:
+            await self.ctx.send.text("群聊中只能授权当前群的管理员", stream_id)
+            return False, "跨群授权", True
 
         assert self._db is not None
         try:
@@ -1399,17 +1690,25 @@ class FeedBotPlugin(MaiBotPlugin):
 
     @Command(
         "admin_revoke",
-        description="取消群管理员授权（Bot管理员）",
+        description="取消群管理员授权（管理员）",
         pattern=r"^/投喂管理\s+取消授权\s+(?P<group_id>\S+)\s+(?P<target_user>\S+)$",
     )
     async def handle_admin_revoke(
         self,
         stream_id: str = "",
         user_id: str = "",
+        group_id: str = "",
         **kwargs: Any,
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 取消授权 命令。"""
-        if not self._is_bot_admin(user_id):
+        if group_id:
+            if self.config.bot_attr.satiety_scope != "per_group":
+                await self.ctx.send.text("全局模式下群管理员不可使用此命令，请联系Bot管理员", stream_id)
+                return False, "全局模式限制", True
+            if not self._is_group_admin(group_id, user_id):
+                await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
+                return False, "非管理员", True
+        elif not self._is_bot_admin(user_id):
             await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
             return False, "非管理员", True
 
@@ -1423,6 +1722,11 @@ class FeedBotPlugin(MaiBotPlugin):
         if not target_group_id or not target_user:
             await self.ctx.send.text("用法：/投喂管理 取消授权 <群号> <QQ号>", stream_id)
             return False, "参数缺失", True
+
+        # 群聊中只能取消授权当前群
+        if group_id and target_group_id != group_id:
+            await self.ctx.send.text("群聊中只能取消授权当前群的管理员", stream_id)
+            return False, "跨群取消授权", True
 
         assert self._db is not None
         self._db.execute(
@@ -1441,7 +1745,7 @@ class FeedBotPlugin(MaiBotPlugin):
     @Command(
         "admin_group_add_item",
         description="上架群内道具（群管理员）",
-        pattern=r"^/投喂管理\s+群上架\s+(?P<name>\S+)\s+(?P<price>\d+)(?:\s+(?P<emoji>\S+))?(?:\s+(?P<desc>.+))?$",
+        pattern=r"^/投喂管理\s+群上架\s+(?P<name>\S+)\s+(?P<price>\d+)(?:\s+(?P<rest>.+))?$",
     )
     async def handle_admin_group_add_item(
         self,
@@ -1465,11 +1769,10 @@ class FeedBotPlugin(MaiBotPlugin):
 
         name = str(matched_groups.get("name") or "").strip()
         price_str = str(matched_groups.get("price") or "").strip()
-        emoji = str(matched_groups.get("emoji") or "").strip()
-        desc = str(matched_groups.get("desc") or "").strip()
+        rest = str(matched_groups.get("rest") or "").strip()
 
         if not name or not price_str:
-            await self.ctx.send.text("用法：/投喂管理 群上架 <名称> <价格> [emoji] [描述]", stream_id)
+            await self.ctx.send.text("用法：/投喂管理 群上架 <名称> <价格> [emoji] [描述] [饱食度N]", stream_id)
             return False, "参数缺失", True
 
         try:
@@ -1477,6 +1780,27 @@ class FeedBotPlugin(MaiBotPlugin):
         except ValueError:
             await self.ctx.send.text("价格必须是整数", stream_id)
             return False, "价格格式错误", True
+
+        # 从剩余文本中提取饱食度和描述
+        satiety_bonus = 5.0
+        emoji = ""
+        desc = ""
+        if rest:
+            import re as _re
+            satiety_match = _re.search(r"饱食度(-?\d+(?:\.\d+)?)", rest)
+            if satiety_match:
+                satiety_bonus = float(satiety_match.group(1))
+                rest = rest[:satiety_match.start()] + rest[satiety_match.end():]
+                rest = rest.strip()
+            if rest:
+                tokens = rest.split(None, 1)
+                # 判断第一个token是否为emoji（非ASCII字符且长度短）
+                first = tokens[0]
+                if len(first) <= 2 and not first.isascii():
+                    emoji = first
+                    desc = tokens[1].strip() if len(tokens) > 1 else ""
+                else:
+                    desc = rest
 
         assert self._db is not None
 
@@ -1492,16 +1816,16 @@ class FeedBotPlugin(MaiBotPlugin):
         self._db.execute(
             """
             INSERT INTO shop_items (name, emoji, description, price, scope, group_id,
-                                     is_on_sale, created_by, created_at)
-            VALUES (?, ?, ?, ?, 'group', ?, 1, ?, ?)
+                                     is_on_sale, satiety_bonus, created_by, created_at)
+            VALUES (?, ?, ?, ?, 'group', ?, 1, ?, ?, ?)
             """,
-            (name, emoji, desc, price, group_id, user_id, time.time()),
+            (name, emoji, desc, price, group_id, satiety_bonus, user_id, time.time()),
         )
         self._db.commit()
 
         display = f"{emoji}{name}" if emoji else name
         await self.ctx.send.text(
-            f"✅ 本群道具「{display}」已上架，价格：{price}积分", stream_id
+            f"✅ 本群道具「{display}」已上架，价格：{price}积分，饱食度{satiety_bonus:+}", stream_id
         )
         return True, f"群上架{name}", True
 
@@ -1550,24 +1874,35 @@ class FeedBotPlugin(MaiBotPlugin):
     # ---- 定时任务 ----
 
     async def _attr_decay_loop(self) -> None:
-        """每小时衰减 bot 属性。"""
+        """每小时衰减 bot 饱食度。"""
         while self._running:
             try:
-                await asyncio.sleep(3600)
                 if not self._running or not self._db:
                     break
 
-                # 衰减饱食度
                 satiety_decay = self.config.bot_attr.satiety_decay_rate
-                self._add_attr("satiety", -satiety_decay)
 
-                # 衰减好感度
-                affection_decay = self.config.bot_attr.affection_decay_rate
-                self._add_attr("affection", -affection_decay)
+                if self.config.bot_attr.satiety_scope == "per_group":
+                    # 群内独立模式：衰减每个群的饱食度
+                    cursor = self._db.execute(
+                        "SELECT group_id, satiety FROM feed_groups WHERE satiety > 0"
+                    )
+                    for row in cursor.fetchall():
+                        gid, current = row[0], row[1]
+                        new_val = max(0.0, current - satiety_decay)
+                        self._db.execute(
+                            "UPDATE feed_groups SET satiety = ? WHERE group_id = ?",
+                            (new_val, gid),
+                        )
+                    self._db.commit()
+                else:
+                    # 全局模式：衰减全局饱食度
+                    current = self._get_satiety()
+                    new_val = max(0.0, current - satiety_decay)
+                    self._set_satiety(new_val)
 
-                self.ctx.logger.debug(
-                    f"属性衰减：饱食度-{satiety_decay}，好感度-{affection_decay}"
-                )
+                self.ctx.logger.debug(f"饱食度衰减：-{satiety_decay}")
+                await asyncio.sleep(3600)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1582,48 +1917,13 @@ class FeedBotPlugin(MaiBotPlugin):
                 if not self._running or not self._db:
                     break
 
-                satiety = self._get_attr("satiety")
                 threshold = self.config.bot_attr.seek_feed_threshold
 
-                if satiety >= threshold:
-                    continue
-
-                # 根据饱食度生成求喂消息
-                if satiety < 10:
-                    seek_msg = "呜呜...好饿好饿...有没有人投喂我呀？🥺"
-                elif satiety < 20:
-                    seek_msg = "肚子咕咕叫了...能投喂我一些吃的吗？😢"
-                elif satiety < 30:
-                    seek_msg = "有点想吃东西了...有人愿意投喂我吗？🥺"
-                else:
-                    seek_msg = "虽然还不算太饿，但如果有人投喂我就好了~"
-
-                # 如果开启了 LLM，尝试生成更自然的求喂消息
-                if self.config.llm.enabled:
-                    try:
-                        llm_result = await self.ctx.llm.generate(
-                            prompt=f"你是一个可爱的聊天机器人，当前饱食度{satiety:.0f}/100，很饿。"
-                            f"请用1-2句简短可爱的语气向群友们撒娇求投喂，可以包含emoji。"
-                            f"不要重复之前的求喂方式，要多样化。",
-                            model=self.config.llm.model,
-                            temperature=0.9,
-                            max_tokens=80,
-                        )
-                        if isinstance(llm_result, dict) and llm_result.get("response"):
-                            generated = llm_result["response"].strip()
-                            if generated:
-                                seek_msg = generated
-                    except Exception as e:
-                        self.ctx.logger.warning(f"LLM生成求喂消息失败: {e}")
-
-                # 获取所有群聊天流并发送求喂消息
+                # 获取所有群聊天流
                 try:
                     group_streams = await self.ctx.chat.get_group_streams()
                     if not group_streams:
                         continue
-
-                    min_interval = self.config.bot_attr.seek_feed_interval_hours * 3600
-                    now = time.time()
 
                     for stream in group_streams:
                         if not isinstance(stream, dict):
@@ -1639,30 +1939,54 @@ class FeedBotPlugin(MaiBotPlugin):
                         if not self._check_permission(stream_group_id, "", True):
                             continue
 
-                        # 检查该群的求喂间隔
-                        assert self._db is not None
-                        cursor = self._db.execute(
-                            "SELECT last_seek_feed_time FROM feed_groups WHERE group_id = ?",
-                            (stream_group_id,),
-                        )
-                        row = cursor.fetchone()
-
-                        if row and row[0] > 0 and (now - row[0]) < min_interval:
+                        # 获取该群的饱食度
+                        satiety = self._get_satiety(stream_group_id)
+                        if satiety >= threshold:
                             continue
+
+                        # 根据饱食度生成求喂消息
+                        if satiety < 10:
+                            seek_msg = "呜呜...好饿好饿...有没有人投喂我呀？🥺"
+                        elif satiety < 20:
+                            seek_msg = "肚子咕咕叫了...能投喂我一些吃的吗？😢"
+                        elif satiety < 30:
+                            seek_msg = "有点想吃东西了...有人愿意投喂我吗？🥺"
+                        else:
+                            seek_msg = "虽然还不算太饿，但如果有人投喂我就好了~"
+
+                        # 如果开启了 LLM，尝试生成更自然的求喂消息
+                        if self.config.llm.enabled:
+                            try:
+                                seek_prompt_parts = [
+                                    f"你是一个可爱的聊天机器人，当前饱食度{satiety:.0f}/100，很饿。",
+                                    "请用1-2句简短的语气向群友们撒娇求投喂，可以包含emoji。",
+                                    "不要重复之前的求喂方式，要多样化。严格遵循你的表达风格。",
+                                ]
+                                try:
+                                    personality = await self.ctx.config.get("personality.personality", "")
+                                    reply_style = await self.ctx.config.get("personality.reply_style", "")
+                                    if personality:
+                                        seek_prompt_parts.append(f"你的人设：{personality}")
+                                    if reply_style:
+                                        seek_prompt_parts.append(f"你的表达风格：{reply_style}")
+                                except Exception:
+                                    pass
+                                llm_result = await self.ctx.llm.generate(
+                                    prompt="\n".join(seek_prompt_parts),
+                                    model=self.config.llm.effective_model,
+                                    temperature=0.9,
+                                    max_tokens=300,
+                                )
+                                if isinstance(llm_result, dict) and llm_result.get("response"):
+                                    generated = llm_result["response"].strip()
+                                    if generated:
+                                        seek_msg = generated
+                            except Exception as e:
+                                self.ctx.logger.warning(f"LLM生成求喂消息失败: {e}")
 
                         # 发送求喂消息
                         try:
                             await self.ctx.send.text(seek_msg, stream_session_id)
-                            # 更新最后求喂时间
-                            self._db.execute(
-                                """
-                                INSERT INTO feed_groups (group_id, enabled, last_seek_feed_time, created_at)
-                                VALUES (?, 1, ?, ?)
-                                ON CONFLICT(group_id) DO UPDATE SET last_seek_feed_time = ?
-                                """,
-                                (stream_group_id, now, now, now),
-                            )
-                            self._db.commit()
                         except Exception as e:
                             self.ctx.logger.warning(f"群{stream_group_id}发送求喂消息失败: {e}")
 
@@ -1684,7 +2008,6 @@ class FeedBotPlugin(MaiBotPlugin):
         item_emoji: str,
         feed_reply_hint: str,
         satiety: float,
-        affection: float,
         recent_feeds: list[tuple[Any, ...]],
     ) -> str:
         """根据投喂上下文生成个性化回复。"""
@@ -1704,20 +2027,30 @@ class FeedBotPlugin(MaiBotPlugin):
         # 构造 prompt
         prompt_parts = [
             f"你是一个可爱的聊天机器人，刚刚被{user_nickname}投喂了{item_emoji}{item_name}。",
-            f"当前你的状态：饱食度{satiety:.0f}/100，好感度{affection:.0f}/100。",
+            f"当前你的状态：饱食度{satiety:.0f}/100。",
         ]
+        # 尝试获取 bot 人设和表达风格
+        try:
+            personality = await self.ctx.config.get("personality.personality", "")
+            reply_style = await self.ctx.config.get("personality.reply_style", "")
+            if personality:
+                prompt_parts.append(f"你的人设：{personality}")
+            if reply_style:
+                prompt_parts.append(f"你的表达风格：{reply_style}")
+        except Exception:
+            pass
         if feed_reply_hint:
             prompt_parts.append(f"投喂提示：{feed_reply_hint}")
         if recent_text:
             prompt_parts.append(f"最近被投喂了：{recent_text}")
-        prompt_parts.append("请用简短可爱的语气回应这次投喂，1-2句话即可，可以包含emoji。不要重复之前说过的话。")
+        prompt_parts.append("请用简短的语气回应这次投喂，1-2句话即可，可以包含emoji。不要重复之前说过的话。严格遵循你的表达风格。")
 
         prompt = "\n".join(prompt_parts)
 
         try:
             result = await self.ctx.llm.generate(
                 prompt=prompt,
-                model=self.config.llm.model,
+                model=self.config.llm.effective_model,
                 temperature=self.config.llm.temperature,
                 max_tokens=self.config.llm.max_tokens,
             )
