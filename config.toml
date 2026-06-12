@@ -11,16 +11,12 @@ consecutive_bonus = 5
 max_consecutive_bonus = 50
 
 [bot_attr]
-satiety_scope = "per_group"
 initial_satiety = 80.0
 satiety_decay_rate = 15.0
 seek_feed_threshold = 30.0
 
 [filter]
-mode = "blacklist"
-group_list = []
-allow_private = false
-allow_group = true
+group_admins = []
 
 [llm]
 enabled = true

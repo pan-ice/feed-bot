@@ -68,7 +68,6 @@ class BotAttrConfig(PluginConfigBase):
     __ui_icon__ = "heart"
     __ui_order__ = 3
 
-    satiety_scope: str = Field(default="global", description="饱食度范围：global（全局共享）或 per_group（群内独立）")
     initial_satiety: float = Field(default=80.0, description="初始饱食度（0-100）")
     satiety_decay_rate: float = Field(default=0.5, description="饱食度每小时衰减量")
     seek_feed_threshold: float = Field(default=30.0, description="饱食度低于此值触发求投喂")
@@ -81,10 +80,10 @@ class FilterConfig(PluginConfigBase):
     __ui_icon__ = "filter"
     __ui_order__ = 4
 
-    mode: str = Field(default="whitelist", description="名单模式：whitelist 或 blacklist")
-    group_list: list[str] = Field(default_factory=list, description="群号列表（白名单/黑名单）")
-    allow_private: bool = Field(default=True, description="是否允许私聊触发")
-    allow_group: bool = Field(default=True, description="是否允许群聊触发")
+    group_admins: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="群管理员配置，每项包含 group_id（群号）和 admin_users（管理员QQ，空格/逗号/|分隔）",
+    )
 
 
 class LLMConfig(PluginConfigBase):
@@ -274,15 +273,6 @@ class FeedBotPlugin(MaiBotPlugin):
             )
             """
         )
-        self._db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS group_admins (
-                group_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                PRIMARY KEY (group_id, user_id)
-            )
-            """
-        )
         self._db.commit()
 
     def _init_bot_attributes(self) -> None:
@@ -305,9 +295,7 @@ class FeedBotPlugin(MaiBotPlugin):
         self._db.commit()
 
     def _migrate_per_group_data(self) -> None:
-        """在 per_group 模式下，将旧的无群号前缀的用户数据迁移为带群号前缀的格式。"""
-        if self.config.bot_attr.satiety_scope != "per_group":
-            return
+        """将旧的无群号前缀的用户数据迁移为带群号前缀的格式。"""
         assert self._db is not None
 
         # 收集所有群号
@@ -407,36 +395,136 @@ class FeedBotPlugin(MaiBotPlugin):
         """判断是否为指定群的管理员（含Bot管理员）。"""
         if self._is_bot_admin(user_id):
             return True
-        assert self._db is not None
-        cursor = self._db.execute(
-            "SELECT 1 FROM group_admins WHERE group_id = ? AND user_id = ?",
-            (group_id, user_id),
-        )
-        return cursor.fetchone() is not None
+        # 检查配置中的群管理员
+        for item in self.config.filter.group_admins:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("group_id", "")) == group_id:
+                raw = str(item.get("admin_users", "") or "")
+                if user_id in self._parse_admin_list(raw):
+                    return True
+        return False
 
-    def _check_permission(self, group_id: str, user_id: str, is_group: bool) -> bool:
-        """检查触发权限：黑白名单 + 群聊/私聊开关。"""
-        # 私聊/群聊开关
-        if not is_group and not self.config.filter.allow_private:
-            return False
-        if is_group and not self.config.filter.allow_group:
-            return False
-
-        # 黑白名单
-        if self.config.filter.mode == "whitelist":
-            if is_group and group_id not in self.config.filter.group_list:
-                return False
-        elif self.config.filter.mode == "blacklist":
-            if is_group and group_id in self.config.filter.group_list:
-                return False
-
-        return True
+    def _parse_admin_list(self, raw: str) -> list[str]:
+        """解析管理员列表字符串，支持空格、逗号、|分隔。"""
+        return [s.strip() for s in raw.replace(",", " ").replace("|", " ").split() if s.strip()]
 
     # ---- 内部方法 ----
 
+    def _enabled_group_ids(self) -> set[str]:
+        """返回配置中授权的所有群号。"""
+        result = set()
+        for item in self.config.filter.group_admins:
+            if isinstance(item, dict):
+                gid = str(item.get("group_id", "") or "").strip()
+                if gid:
+                    result.add(gid)
+        return result
+
+    def _is_group_enabled(self, group_id: str) -> bool:
+        """判断群是否在配置中授权。"""
+        return group_id in self._enabled_group_ids()
+
+    def _check_group_enabled(self, group_id: str) -> bool:
+        """群聊时检查群是否授权，私聊时放行。未授权群静默忽略。"""
+        if group_id and not self._is_group_enabled(group_id):
+            return False
+        return True
+
+    def _save_config_to_file(self) -> None:
+        """将当前配置写入 config.toml 文件。"""
+        try:
+            config_path = os.path.join(PLUGIN_DIR, "config.toml")
+            lines = []
+            # [plugin]
+            lines.append("[plugin]")
+            lines.append(f"enabled = {'true' if self.config.plugin.enabled else 'false'}")
+            lines.append(f'config_version = "{self.config.plugin.config_version}"')
+            lines.append("")
+            # [admin]
+            lines.append("[admin]")
+            admin_users = self.config.admin.admin_users
+            lines.append(f"admin_users = {self._toml_list(admin_users)}")
+            lines.append("")
+            # [sign]
+            lines.append("[sign]")
+            lines.append(f"base_points = {self.config.sign.base_points}")
+            lines.append(f"consecutive_bonus = {self.config.sign.consecutive_bonus}")
+            lines.append(f"max_consecutive_bonus = {self.config.sign.max_consecutive_bonus}")
+            lines.append("")
+            # [bot_attr]
+            lines.append("[bot_attr]")
+            lines.append(f"initial_satiety = {self.config.bot_attr.initial_satiety}")
+            lines.append(f"satiety_decay_rate = {self.config.bot_attr.satiety_decay_rate}")
+            lines.append(f"seek_feed_threshold = {self.config.bot_attr.seek_feed_threshold}")
+            lines.append("")
+            # [filter]
+            lines.append("[filter]")
+            if self.config.filter.group_admins:
+                for item in self.config.filter.group_admins:
+                    if isinstance(item, dict):
+                        gid = str(item.get("group_id", "") or "")
+                        raw = str(item.get("admin_users", "") or "")
+                        lines.append(f"[[filter.group_admins]]")
+                        lines.append(f'group_id = "{gid}"')
+                        lines.append(f'admin_users = "{raw}"')
+            else:
+                lines.append("group_admins = []")
+            lines.append("")
+            # [llm]
+            lines.append("[llm]")
+            lines.append(f"enabled = {'true' if self.config.llm.enabled else 'false'}")
+            lines.append(f'model = "{self.config.llm.model}"')
+            lines.append(f"temperature = {self.config.llm.temperature}")
+            lines.append(f"max_tokens = {self.config.llm.max_tokens}")
+            lines.append(f'fallback_reply = "{self.config.llm.fallback_reply}"')
+            lines.append("")
+
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        except Exception as e:
+            self.ctx.logger.warning(f"保存配置文件失败: {e}")
+
+    @staticmethod
+    def _toml_list(items: list[str]) -> str:
+        """将字符串列表格式化为 TOML 数组。"""
+        if not items:
+            return "[]"
+        return '[' + ", ".join(f'"{i}"' for i in items) + ']'
+
+    def _add_group_admin_to_config(self, target_group_id: str, target_user: str) -> None:
+        """在配置中添加群管理员，若群不存在则创建条目。"""
+        admins = self.config.filter.group_admins
+        for item in admins:
+            if isinstance(item, dict) and str(item.get("group_id", "")) == target_group_id:
+                # 群已存在，追加管理员
+                raw = str(item.get("admin_users", "") or "")
+                existing = self._parse_admin_list(raw)
+                if target_user not in existing:
+                    existing.append(target_user)
+                    item["admin_users"] = ", ".join(existing)
+                self._save_config_to_file()
+                return
+        # 群不存在，创建新条目
+        admins.append({"group_id": target_group_id, "admin_users": target_user})
+        self._save_config_to_file()
+
+    def _remove_group_admin_from_config(self, target_group_id: str, target_user: str) -> None:
+        """在配置中移除群管理员。"""
+        admins = self.config.filter.group_admins
+        for item in admins:
+            if isinstance(item, dict) and str(item.get("group_id", "")) == target_group_id:
+                raw = str(item.get("admin_users", "") or "")
+                existing = self._parse_admin_list(raw)
+                if target_user in existing:
+                    existing.remove(target_user)
+                    item["admin_users"] = ", ".join(existing)
+                self._save_config_to_file()
+                return
+
     def _user_key(self, user_id: str, group_id: str = "") -> str:
-        """per_group 模式下返回 '群号:QQ号'，global 模式下返回原始 user_id。"""
-        if self.config.bot_attr.satiety_scope == "per_group" and group_id:
+        """返回群隔离的用户键 '群号:QQ号'。"""
+        if group_id:
             return f"{group_id}:{user_id}"
         return user_id
 
@@ -468,9 +556,9 @@ class FeedBotPlugin(MaiBotPlugin):
             self._db.commit()
 
     def _get_satiety(self, group_id: str = "") -> float:
-        """获取饱食度，根据配置自动选择全局或群内。如果群未初始化则自动创建记录。"""
+        """获取群饱食度。如果群未初始化则自动创建记录。"""
         assert self._db is not None
-        if self.config.bot_attr.satiety_scope == "per_group" and group_id:
+        if group_id:
             cursor = self._db.execute(
                 "SELECT satiety FROM feed_groups WHERE group_id = ?",
                 (group_id,),
@@ -490,18 +578,18 @@ class FeedBotPlugin(MaiBotPlugin):
             )
             self._db.commit()
             return initial
-        else:
-            cursor = self._db.execute(
-                "SELECT attr_value FROM bot_attributes WHERE attr_key = 'satiety'",
-            )
-            row = cursor.fetchone()
-            return float(row[0]) if row else 0.0
+        # 私聊无群号时，从全局属性读取
+        cursor = self._db.execute(
+            "SELECT attr_value FROM bot_attributes WHERE attr_key = 'satiety'",
+        )
+        row = cursor.fetchone()
+        return float(row[0]) if row else 0.0
 
     def _set_satiety(self, value: float, group_id: str = "") -> None:
-        """设置饱食度（钳位到 0-100），根据配置自动选择全局或群内。"""
+        """设置饱食度（钳位到 0-100）。"""
         assert self._db is not None
         value = max(0.0, min(100.0, value))
-        if self.config.bot_attr.satiety_scope == "per_group" and group_id:
+        if group_id:
             self._db.execute(
                 """
                 INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, created_at)
@@ -585,10 +673,8 @@ class FeedBotPlugin(MaiBotPlugin):
 
         if not user_id:
             return False, "无法获取用户信息", True
-
-        is_group = bool(group_id)
-        if not self._check_permission(group_id, user_id, is_group):
-            return False, "无权限", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
 
         # 提取昵称
         nickname = _extract_nickname(message)
@@ -679,10 +765,8 @@ class FeedBotPlugin(MaiBotPlugin):
 
         if not user_id:
             return False, "无法获取用户信息", True
-
-        is_group = bool(group_id)
-        if not self._check_permission(group_id, user_id, is_group):
-            return False, "无权限", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
 
         nickname = _extract_nickname(message)
         self._ensure_user(user_id, nickname, group_id)
@@ -723,31 +807,20 @@ class FeedBotPlugin(MaiBotPlugin):
         if not group_id:
             await self.ctx.send.text("积分排行仅支持群聊使用", stream_id)
             return False, "非群聊", True
-
-        if not self._check_permission(group_id, user_id, True):
-            return False, "无权限", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
 
         assert self._db is not None
-        if self.config.bot_attr.satiety_scope == "per_group":
-            prefix = f"{group_id}:"
-            cursor = self._db.execute(
-                """
-                SELECT nickname, user_id, points
-                FROM users
-                WHERE user_id LIKE ? AND points > 0
-                ORDER BY points DESC LIMIT 10
-                """,
-                (prefix + "%",),
-            )
-        else:
-            cursor = self._db.execute(
-                """
-                SELECT nickname, user_id, points
-                FROM users
-                WHERE points > 0
-                ORDER BY points DESC LIMIT 10
-                """
-            )
+        prefix = f"{group_id}:"
+        cursor = self._db.execute(
+            """
+            SELECT nickname, user_id, points
+            FROM users
+            WHERE user_id LIKE ? AND points > 0
+            ORDER BY points DESC LIMIT 10
+            """,
+            (prefix + "%",),
+        )
         rows = cursor.fetchall()
 
         if not rows:
@@ -779,10 +852,8 @@ class FeedBotPlugin(MaiBotPlugin):
 
         if not user_id:
             return False, "无法获取用户信息", True
-
-        is_group = bool(group_id)
-        if not self._check_permission(group_id, user_id, is_group):
-            return False, "无权限", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
 
         assert self._db is not None
 
@@ -850,10 +921,8 @@ class FeedBotPlugin(MaiBotPlugin):
         """处理 /购买 命令。"""
         if not user_id:
             return False, "无法获取用户信息", True
-
-        is_group = bool(group_id)
-        if not self._check_permission(group_id, user_id, is_group):
-            return False, "无权限", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
 
         # 获取道具名
         matched_groups = kwargs.get("matched_groups")
@@ -930,10 +999,8 @@ class FeedBotPlugin(MaiBotPlugin):
 
         if not user_id:
             return False, "无法获取用户信息", True
-
-        is_group = bool(group_id)
-        if not self._check_permission(group_id, user_id, is_group):
-            return False, "无权限", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
 
         assert self._db is not None
         uid = self._user_key(user_id, group_id)
@@ -977,10 +1044,8 @@ class FeedBotPlugin(MaiBotPlugin):
         """处理 /投喂 命令。"""
         if not user_id:
             return False, "无法获取用户信息", True
-
-        is_group = bool(group_id)
-        if not self._check_permission(group_id, user_id, is_group):
-            return False, "无权限", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
 
         matched_groups = kwargs.get("matched_groups")
         if not isinstance(matched_groups, dict):
@@ -1100,10 +1165,8 @@ class FeedBotPlugin(MaiBotPlugin):
 
         if not user_id:
             return False, "无法获取用户信息", True
-
-        is_group = bool(group_id)
-        if not self._check_permission(group_id, user_id, is_group):
-            return False, "无权限", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
 
         assert self._db is not None
         uid = self._user_key(user_id, group_id)
@@ -1148,10 +1211,8 @@ class FeedBotPlugin(MaiBotPlugin):
 
         if not user_id:
             return False, "无法获取用户信息", True
-
-        is_group = bool(group_id)
-        if not self._check_permission(group_id, user_id, is_group):
-            return False, "无权限", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
 
         satiety = self._get_satiety(group_id)
 
@@ -1165,7 +1226,7 @@ class FeedBotPlugin(MaiBotPlugin):
         else:
             desc = "好饿好饿！快投喂我！"
 
-        scope_hint = "（本群）" if self.config.bot_attr.satiety_scope == "per_group" and group_id else ""
+        scope_hint = "（本群）" if group_id else ""
         msg = f"🍖 当前饱食度{scope_hint}：{satiety:.0f}/100 — {desc}"
         await self.ctx.send.text(msg, stream_id)
         return True, "饱食度", True
@@ -1184,31 +1245,20 @@ class FeedBotPlugin(MaiBotPlugin):
         if not group_id:
             await self.ctx.send.text("投喂排行仅支持群聊使用", stream_id)
             return False, "非群聊", True
-
-        if not self._check_permission(group_id, user_id, True):
-            return False, "无权限", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
 
         assert self._db is not None
-        if self.config.bot_attr.satiety_scope == "per_group":
-            prefix = f"{group_id}:"
-            cursor = self._db.execute(
-                """
-                SELECT u.nickname, u.user_id, u.total_feed_count
-                FROM users u
-                WHERE u.user_id LIKE ? AND u.total_feed_count > 0
-                ORDER BY u.total_feed_count DESC LIMIT 10
-                """,
-                (prefix + "%",),
-            )
-        else:
-            cursor = self._db.execute(
-                """
-                SELECT u.nickname, u.user_id, u.total_feed_count
-                FROM users u
-                WHERE u.total_feed_count > 0
-                ORDER BY u.total_feed_count DESC LIMIT 10
-                """
-            )
+        prefix = f"{group_id}:"
+        cursor = self._db.execute(
+            """
+            SELECT u.nickname, u.user_id, u.total_feed_count
+            FROM users u
+            WHERE u.user_id LIKE ? AND u.total_feed_count > 0
+            ORDER BY u.total_feed_count DESC LIMIT 10
+            """,
+            (prefix + "%",),
+        )
         rows = cursor.fetchall()
 
         if not rows:
@@ -1367,9 +1417,6 @@ class FeedBotPlugin(MaiBotPlugin):
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 修改饱食度 命令。"""
         if group_id:
-            if self.config.bot_attr.satiety_scope != "per_group":
-                await self.ctx.send.text("全局模式下群管理员不可使用此命令，请联系Bot管理员", stream_id)
-                return False, "全局模式限制", True
             if not self._is_group_admin(group_id, user_id):
                 await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
                 return False, "非管理员", True
@@ -1421,9 +1468,6 @@ class FeedBotPlugin(MaiBotPlugin):
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 积分 命令。"""
         if group_id:
-            if self.config.bot_attr.satiety_scope != "per_group":
-                await self.ctx.send.text("全局模式下群管理员不可使用此命令，请联系Bot管理员", stream_id)
-                return False, "全局模式限制", True
             if not self._is_group_admin(group_id, user_id):
                 await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
                 return False, "非管理员", True
@@ -1443,10 +1487,10 @@ class FeedBotPlugin(MaiBotPlugin):
             await self.ctx.send.text("用法：/投喂管理 积分 <QQ号> <数量> [群号]", stream_id)
             return False, "参数缺失", True
 
-        # per_group 模式下确定目标群号
+        # 确定目标群号
         effective_group = target_group or group_id
-        if self.config.bot_attr.satiety_scope == "per_group" and not effective_group:
-            await self.ctx.send.text("分群模式下需要指定群号：/投喂管理 积分 <QQ号> <数量> <群号>", stream_id)
+        if not effective_group:
+            await self.ctx.send.text("需要指定群号：/投喂管理 积分 <QQ号> <数量> <群号>", stream_id)
             return False, "缺少群号", True
 
         try:
@@ -1487,9 +1531,6 @@ class FeedBotPlugin(MaiBotPlugin):
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 属性 命令。"""
         if group_id:
-            if self.config.bot_attr.satiety_scope != "per_group":
-                await self.ctx.send.text("全局模式下群管理员不可使用此命令，请联系Bot管理员", stream_id)
-                return False, "全局模式限制", True
             if not self._is_group_admin(group_id, user_id):
                 await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
                 return False, "非管理员", True
@@ -1526,58 +1567,6 @@ class FeedBotPlugin(MaiBotPlugin):
         return True, f"设置属性{attr_key}", True
 
     @Command(
-        "admin_seek_feed",
-        description="触发求投喂（Bot管理员）",
-        pattern=r"^/投喂管理\s+求喂\s+(?P<group_id>\S+)\s+(?P<message>.+)$",
-    )
-    async def handle_admin_seek_feed(
-        self,
-        stream_id: str = "",
-        user_id: str = "",
-        group_id: str = "",
-        **kwargs: Any,
-    ) -> tuple[bool, str, bool]:
-        """处理 /投喂管理 求喂 命令。"""
-        if group_id:
-            await self.ctx.send.text("Bot管理员命令请私聊Bot使用", stream_id)
-            return False, "非私聊", True
-        if not self._is_bot_admin(user_id):
-            await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
-            return False, "非管理员", True
-
-        matched_groups = kwargs.get("matched_groups")
-        if not isinstance(matched_groups, dict):
-            matched_groups = {}
-
-        target_group_id = str(matched_groups.get("group_id") or "").strip()
-        seek_msg = str(matched_groups.get("message") or "").strip()
-
-        if not target_group_id or not seek_msg:
-            await self.ctx.send.text("用法：/投喂管理 求喂 <群号> <消息>", stream_id)
-            return False, "参数缺失", True
-
-        # 查找群的聊天流
-        chat_stream = await self.ctx.chat.get_stream_by_group_id(target_group_id)
-        if not chat_stream:
-            await self.ctx.send.text(f"未找到群 {target_group_id} 的聊天流", stream_id)
-            return False, "聊天流不存在", True
-
-        # 获取 session_id
-        target_stream_id = ""
-        if isinstance(chat_stream, dict):
-            target_stream_id = str(chat_stream.get("session_id", ""))
-        elif hasattr(chat_stream, "session_id"):
-            target_stream_id = str(chat_stream.session_id)
-
-        if not target_stream_id:
-            await self.ctx.send.text(f"无法获取群 {target_group_id} 的聊天流ID", stream_id)
-            return False, "聊天流ID为空", True
-
-        await self.ctx.send.text(seek_msg, target_stream_id)
-        await self.ctx.send.text(f"✅ 已在群 {target_group_id} 发送求投喂消息", stream_id)
-        return True, "求投喂", True
-
-    @Command(
         "admin_reset_sign",
         description="重置用户签到（管理员）",
         pattern=r"^/投喂管理\s+重置签到\s+(?P<target_user>\S+)(?:\s+(?P<target_group>\S+))?$",
@@ -1591,9 +1580,6 @@ class FeedBotPlugin(MaiBotPlugin):
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 重置签到 命令。"""
         if group_id:
-            if self.config.bot_attr.satiety_scope != "per_group":
-                await self.ctx.send.text("全局模式下群管理员不可使用此命令，请联系Bot管理员", stream_id)
-                return False, "全局模式限制", True
             if not self._is_group_admin(group_id, user_id):
                 await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
                 return False, "非管理员", True
@@ -1612,10 +1598,10 @@ class FeedBotPlugin(MaiBotPlugin):
             await self.ctx.send.text("用法：/投喂管理 重置签到 <QQ号> [群号]", stream_id)
             return False, "参数缺失", True
 
-        # per_group 模式下确定目标群号
+        # 确定目标群号
         effective_group = target_group or group_id
-        if self.config.bot_attr.satiety_scope == "per_group" and not effective_group:
-            await self.ctx.send.text("分群模式下需要指定群号：/投喂管理 重置签到 <QQ号> <群号>", stream_id)
+        if not effective_group:
+            await self.ctx.send.text("需要指定群号：/投喂管理 重置签到 <QQ号> <群号>", stream_id)
             return False, "缺少群号", True
 
         assert self._db is not None
@@ -1646,9 +1632,6 @@ class FeedBotPlugin(MaiBotPlugin):
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 授权 命令。"""
         if group_id:
-            if self.config.bot_attr.satiety_scope != "per_group":
-                await self.ctx.send.text("全局模式下群管理员不可使用此命令，请联系Bot管理员", stream_id)
-                return False, "全局模式限制", True
             if not self._is_group_admin(group_id, user_id):
                 await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
                 return False, "非管理员", True
@@ -1672,16 +1655,7 @@ class FeedBotPlugin(MaiBotPlugin):
             await self.ctx.send.text("群聊中只能授权当前群的管理员", stream_id)
             return False, "跨群授权", True
 
-        assert self._db is not None
-        try:
-            self._db.execute(
-                "INSERT OR IGNORE INTO group_admins (group_id, user_id) VALUES (?, ?)",
-                (target_group_id, target_user),
-            )
-            self._db.commit()
-        except sqlite3.Error as e:
-            await self.ctx.send.text(f"授权失败：{e}", stream_id)
-            return False, "授权失败", True
+        self._add_group_admin_to_config(target_group_id, target_user)
 
         await self.ctx.send.text(
             f"✅ 已授权 {target_user} 为群 {target_group_id} 的管理员", stream_id
@@ -1702,9 +1676,6 @@ class FeedBotPlugin(MaiBotPlugin):
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 取消授权 命令。"""
         if group_id:
-            if self.config.bot_attr.satiety_scope != "per_group":
-                await self.ctx.send.text("全局模式下群管理员不可使用此命令，请联系Bot管理员", stream_id)
-                return False, "全局模式限制", True
             if not self._is_group_admin(group_id, user_id):
                 await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
                 return False, "非管理员", True
@@ -1728,12 +1699,7 @@ class FeedBotPlugin(MaiBotPlugin):
             await self.ctx.send.text("群聊中只能取消授权当前群的管理员", stream_id)
             return False, "跨群取消授权", True
 
-        assert self._db is not None
-        self._db.execute(
-            "DELETE FROM group_admins WHERE group_id = ? AND user_id = ?",
-            (target_group_id, target_user),
-        )
-        self._db.commit()
+        self._remove_group_admin_from_config(target_group_id, target_user)
 
         await self.ctx.send.text(
             f"✅ 已取消 {target_user} 在群 {target_group_id} 的管理员权限", stream_id
@@ -1882,24 +1848,18 @@ class FeedBotPlugin(MaiBotPlugin):
 
                 satiety_decay = self.config.bot_attr.satiety_decay_rate
 
-                if self.config.bot_attr.satiety_scope == "per_group":
-                    # 群内独立模式：衰减每个群的饱食度
-                    cursor = self._db.execute(
-                        "SELECT group_id, satiety FROM feed_groups WHERE satiety > 0"
-                    )
-                    for row in cursor.fetchall():
-                        gid, current = row[0], row[1]
-                        new_val = max(0.0, current - satiety_decay)
-                        self._db.execute(
-                            "UPDATE feed_groups SET satiety = ? WHERE group_id = ?",
-                            (new_val, gid),
-                        )
-                    self._db.commit()
-                else:
-                    # 全局模式：衰减全局饱食度
-                    current = self._get_satiety()
+                # 衰减每个群的饱食度
+                cursor = self._db.execute(
+                    "SELECT group_id, satiety FROM feed_groups WHERE satiety > 0"
+                )
+                for row in cursor.fetchall():
+                    gid, current = row[0], row[1]
                     new_val = max(0.0, current - satiety_decay)
-                    self._set_satiety(new_val)
+                    self._db.execute(
+                        "UPDATE feed_groups SET satiety = ? WHERE group_id = ?",
+                        (new_val, gid),
+                    )
+                self._db.commit()
 
                 self.ctx.logger.debug(f"饱食度衰减：-{satiety_decay}")
                 await asyncio.sleep(3600)
@@ -1934,9 +1894,7 @@ class FeedBotPlugin(MaiBotPlugin):
 
                         if not stream_group_id or not stream_session_id:
                             continue
-
-                        # 检查黑白名单
-                        if not self._check_permission(stream_group_id, "", True):
+                        if not self._is_group_enabled(stream_group_id):
                             continue
 
                         # 获取该群的饱食度
