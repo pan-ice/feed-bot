@@ -17,7 +17,9 @@ seek_feed_threshold = 30.0
 seek_feed_cooldown = 7200.0
 
 [filter]
-group_admins = []
+[[filter.group_admins]]
+group_id = "716028544"
+admin_users = "2669494215"
 
 [llm]
 enabled = true

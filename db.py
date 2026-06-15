@@ -34,7 +34,7 @@ class AsyncDatabase:
 
     def open(self) -> None:
         """打开数据库连接并初始化表结构（同步，由 asyncio.to_thread 调用）。"""
-        self._db = sqlite3.connect(DB_PATH)
+        self._db = sqlite3.connect(DB_PATH, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._init_tables()
         self._init_bot_attributes()
