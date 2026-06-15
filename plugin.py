@@ -27,7 +27,7 @@ class FeedBotPlugin(
 
     def __init__(self) -> None:
         super().__init__()
-        self.db = AsyncDatabase(self.config)
+        self.db = AsyncDatabase()
         self._running: bool = False
         self._decay_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._seek_feed_task: asyncio.Task | None = None  # type: ignore[type-arg]
@@ -39,6 +39,8 @@ class FeedBotPlugin(
         import os
         os.makedirs(DATA_DIR, exist_ok=True)
 
+        # 配置在 on_load 时才可用，此时传给 db
+        self.db.config = self.config
         await asyncio.to_thread(self.db.open)
 
         self._running = True

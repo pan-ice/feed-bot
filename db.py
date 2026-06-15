@@ -15,10 +15,20 @@ from .utils import DB_PATH
 class AsyncDatabase:
     """线程安全的异步 SQLite 数据库封装。"""
 
-    def __init__(self, config: FeedBotConfig) -> None:
-        self._config = config
+    def __init__(self, config: FeedBotConfig | None = None) -> None:
+        self._config: FeedBotConfig | None = config
         self._db: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+
+    @property
+    def config(self) -> FeedBotConfig:
+        if self._config is None:
+            raise RuntimeError("数据库配置尚未注入，请在 on_load 后使用")
+        return self._config
+
+    @config.setter
+    def config(self, value: FeedBotConfig) -> None:
+        self._config = value
 
     # ---- 连接管理 ----
 
@@ -248,7 +258,7 @@ class AsyncDatabase:
         assert self._db is not None
         now = time.time()
         defaults = [
-            ("satiety", self._config.bot_attr.initial_satiety, now),
+            ("satiety", self.config.bot_attr.initial_satiety, now),
         ]
         for attr_key, attr_value, ts in defaults:
             cursor = self._db.execute(
