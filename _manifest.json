@@ -12,7 +12,7 @@
   "urls": {
     "repository": "https://github.com/pan-ice/feed-bot",
     "homepage": "https://github.com/pan-ice/feed-bot",
-    "documentation": "https://github.com/pan-ice/feed-bot/blob/master/README.md",
+    "documentation": "https://github.com/pan-ice/feed-bot/blob/main/README.md",
     "issues": "https://github.com/pan-ice/feed-bot/issues"
   },
   "host_application": {
