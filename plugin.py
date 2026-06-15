@@ -7,9 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sqlite3
+import threading
 import time
-from datetime import datetime
+import unicodedata
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from typing import Any
 
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
@@ -22,6 +26,30 @@ from maibot_sdk.types import EventType
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "feed_bot.db")
+
+# ---------------------------------------------------------------------------
+# 辅助工具
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _atomic_write(path: str, mode: str = "w", encoding: str | None = None):
+    """原子写入：先写临时文件，成功后 os.replace 替换。"""
+    tmp_path = path + ".tmp"
+    try:
+        with open(tmp_path, mode, encoding=encoding) as f:
+            yield f
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
 
 # ---------------------------------------------------------------------------
 # 配置模型
@@ -71,6 +99,9 @@ class BotAttrConfig(PluginConfigBase):
     initial_satiety: float = Field(default=80.0, description="初始饱食度（0-100）")
     satiety_decay_rate: float = Field(default=0.5, description="饱食度每小时衰减量")
     seek_feed_threshold: float = Field(default=30.0, description="饱食度低于此值触发求投喂")
+    seek_feed_cooldown: float = Field(
+        default=7200.0, description="求投喂消息冷却时间（秒，默认2小时）"
+    )
 
 
 class FilterConfig(PluginConfigBase):
@@ -129,6 +160,7 @@ class FeedBotPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._db: sqlite3.Connection | None = None
+        self._db_lock: threading.Lock = threading.Lock()
         self._running: bool = False
         self._decay_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._seek_feed_task: asyncio.Task | None = None  # type: ignore[type-arg]
@@ -139,11 +171,14 @@ class FeedBotPlugin(MaiBotPlugin):
         """插件加载时初始化数据目录和数据库。"""
         os.makedirs(DATA_DIR, exist_ok=True)
 
-        self._db = sqlite3.connect(DB_PATH)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._init_tables()
-        self._init_bot_attributes()
-        self._migrate_per_group_data()
+        def _init_db() -> None:
+            self._db = sqlite3.connect(DB_PATH)
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._init_tables()
+            self._init_bot_attributes()
+            self._migrate_per_group_data()
+
+        await asyncio.to_thread(_init_db)
 
         self._running = True
         self._decay_task = asyncio.create_task(self._attr_decay_loop())
@@ -161,14 +196,117 @@ class FeedBotPlugin(MaiBotPlugin):
             self._seek_feed_task.cancel()
             self._seek_feed_task = None
         if self._db:
-            self._db.close()
-            self._db = None
+            db = self._db
+            self._db = None  # 先置空防止后续调用
+            await asyncio.to_thread(db.close)
         self.ctx.logger.info("投喂插件已卸载")
 
     async def on_config_update(
         self, scope: str, config_data: dict[str, Any], version: str
     ) -> None:
-        """配置热重载时执行。"""
+        """配置热重载时重启后台任务以使用新配置。"""
+        if scope != "self":
+            return
+
+        self.ctx.logger.info(f"投喂插件配置已更新 (v{version})，重启后台任务")
+
+        # 取消旧任务
+        if self._decay_task:
+            self._decay_task.cancel()
+            self._decay_task = None
+        if self._seek_feed_task:
+            self._seek_feed_task.cancel()
+            self._seek_feed_task = None
+
+        # 用新配置重新启动任务
+        if self._running and self._db:
+            self._decay_task = asyncio.create_task(self._attr_decay_loop())
+            self._seek_feed_task = asyncio.create_task(self._seek_feed_loop())
+
+    # ---- 异步数据库辅助方法 ----
+
+    async def _db_execute(
+        self, sql: str, params: tuple[Any, ...] | list[Any] = ()
+    ) -> list[tuple[Any, ...]]:
+        """线程安全地执行 SQL 并返回 fetchall 结果。"""
+
+        def _do() -> list[tuple[Any, ...]]:
+            if self._db is None:
+                raise RuntimeError("数据库未初始化")
+            with self._db_lock:
+                cursor = self._db.execute(sql, params)
+                return cursor.fetchall()
+
+        return await asyncio.to_thread(_do)
+
+    async def _db_fetchone(
+        self, sql: str, params: tuple[Any, ...] | list[Any] = ()
+    ) -> tuple[Any, ...] | None:
+        """线程安全地执行 SQL 并返回 fetchone 结果。"""
+
+        def _do() -> tuple[Any, ...] | None:
+            if self._db is None:
+                raise RuntimeError("数据库未初始化")
+            with self._db_lock:
+                cursor = self._db.execute(sql, params)
+                return cursor.fetchone()
+
+        return await asyncio.to_thread(_do)
+
+    async def _db_execute_commit(
+        self, sql: str, params: tuple[Any, ...] | list[Any] = ()
+    ) -> None:
+        """线程安全地执行 SQL 并提交。"""
+
+        def _do() -> None:
+            if self._db is None:
+                raise RuntimeError("数据库未初始化")
+            with self._db_lock:
+                self._db.execute(sql, params)
+                self._db.commit()
+
+        await asyncio.to_thread(_do)
+
+    async def _db_execute_rowcount(
+        self, sql: str, params: tuple[Any, ...] | list[Any] = ()
+    ) -> int:
+        """线程安全地执行 UPDATE/DELETE 并返回影响行数。"""
+
+        def _do() -> int:
+            if self._db is None:
+                raise RuntimeError("数据库未初始化")
+            with self._db_lock:
+                cursor = self._db.execute(sql, params)
+                self._db.commit()
+                return cursor.rowcount
+
+        return await asyncio.to_thread(_do)
+
+    async def _db_commit(self) -> None:
+        """线程安全地提交事务。"""
+
+        def _do() -> None:
+            if self._db is None:
+                raise RuntimeError("数据库未初始化")
+            with self._db_lock:
+                self._db.commit()
+
+        await asyncio.to_thread(_do)
+
+    async def _db_execute_many(
+        self, sql: str, params_seq: list[tuple[Any, ...]]
+    ) -> None:
+        """线程安全地执行多条 SQL 并提交。"""
+
+        def _do() -> None:
+            if self._db is None:
+                raise RuntimeError("数据库未初始化")
+            with self._db_lock:
+                for params in params_seq:
+                    self._db.execute(sql, params)
+                self._db.commit()
+
+        await asyncio.to_thread(_do)
 
     # ---- 数据库初始化 ----
 
@@ -268,11 +406,24 @@ class FeedBotPlugin(MaiBotPlugin):
                 enabled INTEGER NOT NULL DEFAULT 1,
                 satiety REAL NOT NULL DEFAULT -1,
                 last_seek_feed_time REAL NOT NULL DEFAULT 0,
-                seek_feed_message TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL
             )
             """
         )
+
+        # 迁移：添加 last_decay_time 列（基于时间戳衰减）
+        try:
+            self._db.execute(
+                "ALTER TABLE feed_groups ADD COLUMN last_decay_time REAL NOT NULL DEFAULT 0"
+            )
+            # 将现有记录的 last_decay_time 设为当前时间，避免首次加载大量衰减
+            self._db.execute(
+                "UPDATE feed_groups SET last_decay_time = ? WHERE last_decay_time = 0 AND satiety >= 0",
+                (time.time(),),
+            )
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+
         self._db.commit()
 
     def _init_bot_attributes(self) -> None:
@@ -299,7 +450,7 @@ class FeedBotPlugin(MaiBotPlugin):
         assert self._db is not None
 
         # 收集所有群号
-        group_ids = set()
+        group_ids: set[str] = set()
         cursor = self._db.execute("SELECT group_id FROM feed_groups")
         for row in cursor.fetchall():
             if row[0]:
@@ -324,7 +475,7 @@ class FeedBotPlugin(MaiBotPlugin):
                 continue
 
             # 从 feed_records 获取该群投喂过的旧用户（纯QQ号，无冒号前缀）
-            old_users = set()
+            old_users: set[str] = set()
             cursor = self._db.execute(
                 "SELECT DISTINCT user_id FROM feed_records WHERE group_id = ? AND user_id NOT LIKE ?",
                 (gid, prefix + "%"),
@@ -413,7 +564,7 @@ class FeedBotPlugin(MaiBotPlugin):
 
     def _enabled_group_ids(self) -> set[str]:
         """返回配置中授权的所有群号。"""
-        result = set()
+        result: set[str] = set()
         for item in self.config.filter.group_admins:
             if isinstance(item, dict):
                 gid = str(item.get("group_id", "") or "").strip()
@@ -432,10 +583,10 @@ class FeedBotPlugin(MaiBotPlugin):
         return True
 
     def _save_config_to_file(self) -> None:
-        """将当前配置写入 config.toml 文件。"""
+        """将当前配置原子写入 config.toml 文件。"""
         try:
             config_path = os.path.join(PLUGIN_DIR, "config.toml")
-            lines = []
+            lines: list[str] = []
             # [plugin]
             lines.append("[plugin]")
             lines.append(f"enabled = {'true' if self.config.plugin.enabled else 'false'}")
@@ -457,6 +608,7 @@ class FeedBotPlugin(MaiBotPlugin):
             lines.append(f"initial_satiety = {self.config.bot_attr.initial_satiety}")
             lines.append(f"satiety_decay_rate = {self.config.bot_attr.satiety_decay_rate}")
             lines.append(f"seek_feed_threshold = {self.config.bot_attr.seek_feed_threshold}")
+            lines.append(f"seek_feed_cooldown = {self.config.bot_attr.seek_feed_cooldown}")
             lines.append("")
             # [filter]
             lines.append("[filter]")
@@ -465,7 +617,7 @@ class FeedBotPlugin(MaiBotPlugin):
                     if isinstance(item, dict):
                         gid = str(item.get("group_id", "") or "")
                         raw = str(item.get("admin_users", "") or "")
-                        lines.append(f"[[filter.group_admins]]")
+                        lines.append("[[filter.group_admins]]")
                         lines.append(f'group_id = "{gid}"')
                         lines.append(f'admin_users = "{raw}"')
             else:
@@ -480,7 +632,7 @@ class FeedBotPlugin(MaiBotPlugin):
             lines.append(f'fallback_reply = "{self.config.llm.fallback_reply}"')
             lines.append("")
 
-            with open(config_path, "w", encoding="utf-8") as f:
+            with _atomic_write(config_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
         except Exception as e:
             self.ctx.logger.warning(f"保存配置文件失败: {e}")
@@ -528,16 +680,15 @@ class FeedBotPlugin(MaiBotPlugin):
             return f"{group_id}:{user_id}"
         return user_id
 
-    def _ensure_user(self, user_id: str, nickname: str, group_id: str = "") -> None:
+    async def _ensure_user(self, user_id: str, nickname: str, group_id: str = "") -> None:
         """确保用户存在于数据库中。per_group 模式下按群隔离。"""
         uid = self._user_key(user_id, group_id)
-        assert self._db is not None
-        cursor = self._db.execute(
+        row = await self._db_fetchone(
             "SELECT 1 FROM users WHERE user_id = ?",
             (uid,),
         )
-        if cursor.fetchone() is None:
-            self._db.execute(
+        if row is None:
+            await self._db_execute_commit(
                 """
                 INSERT INTO users (user_id, nickname, points, total_sign_days,
                                    consecutive_sign_days, last_sign_time,
@@ -546,73 +697,101 @@ class FeedBotPlugin(MaiBotPlugin):
                 """,
                 (uid, nickname, time.time()),
             )
-            self._db.commit()
         elif nickname:
             # 更新昵称
-            self._db.execute(
+            await self._db_execute_commit(
                 "UPDATE users SET nickname = ? WHERE user_id = ? AND nickname != ?",
                 (nickname, uid, nickname),
             )
-            self._db.commit()
 
-    def _get_satiety(self, group_id: str = "") -> float:
-        """获取群饱食度。如果群未初始化则自动创建记录。"""
-        assert self._db is not None
+    async def _apply_satiety_decay(self, group_id: str) -> float:
+        """基于时间差计算并应用饱食度衰减，返回衰减后的值。"""
+        row = await self._db_fetchone(
+            "SELECT satiety, last_decay_time FROM feed_groups WHERE group_id = ?",
+            (group_id,),
+        )
+        if row is None:
+            return self.config.bot_attr.initial_satiety
+
+        satiety, last_decay_time = row[0], row[1]
+        if satiety < 0:
+            return self.config.bot_attr.initial_satiety
+
+        now = time.time()
+        if last_decay_time > 0:
+            hours_elapsed = (now - last_decay_time) / 3600.0
+            decay = hours_elapsed * self.config.bot_attr.satiety_decay_rate
+            satiety = max(0.0, satiety - decay)
+
+        await self._db_execute_commit(
+            "UPDATE feed_groups SET satiety = ?, last_decay_time = ? WHERE group_id = ?",
+            (satiety, now, group_id),
+        )
+        return satiety
+
+    async def _get_satiety(self, group_id: str = "") -> float:
+        """获取群饱食度（基于时间差补偿衰减）。如果群未初始化则自动创建记录。"""
         if group_id:
-            cursor = self._db.execute(
-                "SELECT satiety FROM feed_groups WHERE group_id = ?",
-                (group_id,),
-            )
-            row = cursor.fetchone()
-            if row is not None and row[0] >= 0:
-                return float(row[0])
+            # 先应用基于时间的衰减
+            satiety = await self._apply_satiety_decay(group_id)
+            if satiety >= 0:
+                return satiety
             # 群未初始化饱食度，自动创建记录并写入初始值
             initial = self.config.bot_attr.initial_satiety
-            self._db.execute(
+            now = time.time()
+            await self._db_execute_commit(
                 """
-                INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, created_at)
-                VALUES (?, 1, ?, 0, ?)
-                ON CONFLICT(group_id) DO UPDATE SET satiety = ?
+                INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
+                VALUES (?, 1, ?, 0, ?, ?)
+                ON CONFLICT(group_id) DO UPDATE SET satiety = ?, last_decay_time = ?
                 """,
-                (group_id, initial, time.time(), initial),
+                (group_id, initial, now, time.time(), initial, now),
             )
-            self._db.commit()
             return initial
         # 私聊无群号时，从全局属性读取
-        cursor = self._db.execute(
-            "SELECT attr_value FROM bot_attributes WHERE attr_key = 'satiety'",
+        row = await self._db_fetchone(
+            "SELECT attr_value, last_update_time FROM bot_attributes WHERE attr_key = 'satiety'",
         )
-        row = cursor.fetchone()
-        return float(row[0]) if row else 0.0
-
-    def _set_satiety(self, value: float, group_id: str = "") -> None:
-        """设置饱食度（钳位到 0-100）。"""
-        assert self._db is not None
-        value = max(0.0, min(100.0, value))
-        if group_id:
-            self._db.execute(
-                """
-                INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, created_at)
-                VALUES (?, 1, ?, 0, ?)
-                ON CONFLICT(group_id) DO UPDATE SET satiety = ?
-                """,
-                (group_id, value, time.time(), value),
-            )
-            self._db.commit()
-        else:
-            self._db.execute(
+        if not row:
+            return 0.0
+        # 基于时间差补偿全局饱食度衰减
+        satiety, last_update = row[0], row[1]
+        now = time.time()
+        if last_update > 0:
+            hours_elapsed = (now - last_update) / 3600.0
+            decay = hours_elapsed * self.config.bot_attr.satiety_decay_rate
+            satiety = max(0.0, satiety - decay)
+            await self._db_execute_commit(
                 "UPDATE bot_attributes SET attr_value = ?, last_update_time = ? WHERE attr_key = 'satiety'",
-                (value, time.time()),
+                (satiety, now),
             )
-            self._db.commit()
+        return satiety
 
-    def _find_shop_item(self, item_name: str, group_id: str) -> dict[str, Any] | None:
+    async def _set_satiety(self, value: float, group_id: str = "") -> None:
+        """设置饱食度（钳位到 0-100）。"""
+        value = max(0.0, min(100.0, value))
+        now = time.time()
+        if group_id:
+            await self._db_execute_commit(
+                """
+                INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
+                VALUES (?, 1, ?, 0, ?, ?)
+                ON CONFLICT(group_id) DO UPDATE SET satiety = ?, last_decay_time = ?
+                """,
+                (group_id, value, now, time.time(), value, now),
+            )
+        else:
+            await self._db_execute_commit(
+                "UPDATE bot_attributes SET attr_value = ?, last_update_time = ? WHERE attr_key = 'satiety'",
+                (value, now),
+            )
+
+    async def _find_shop_item(self, item_name: str, group_id: str) -> dict[str, Any] | None:
         """查找道具：优先本群专属，其次全局。"""
-        assert self._db is not None
 
         # 优先查找群内道具
         if group_id:
-            cursor = self._db.execute(
+            row = await self._db_fetchone(
                 """
                 SELECT item_id, name, emoji, description, price, feed_reply_hint,
                        category, satiety_bonus, scope, group_id
@@ -621,12 +800,11 @@ class FeedBotPlugin(MaiBotPlugin):
                 """,
                 (item_name, group_id),
             )
-            row = cursor.fetchone()
             if row:
                 return self._row_to_item_dict(row)
 
         # 其次查找全局道具
-        cursor = self._db.execute(
+        row = await self._db_fetchone(
             """
             SELECT item_id, name, emoji, description, price, feed_reply_hint,
                    category, satiety_bonus, scope, group_id
@@ -635,7 +813,6 @@ class FeedBotPlugin(MaiBotPlugin):
             """,
             (item_name,),
         )
-        row = cursor.fetchone()
         if row:
             return self._row_to_item_dict(row)
 
@@ -656,6 +833,20 @@ class FeedBotPlugin(MaiBotPlugin):
             "scope": row[8],
             "group_id": row[9],
         }
+
+    @staticmethod
+    def _is_likely_emoji(text: str) -> bool:
+        """判断文本是否可能是单个 emoji 或 emoji 序列。"""
+        if not text or text.isascii():
+            return False
+        # 去除变体选择符和零宽连接符后检查
+        stripped = text
+        for ch in ("️", "‍", "︎"):  # VS-16, ZWJ, VS-15
+            stripped = stripped.replace(ch, "")
+        if not stripped:
+            return True  # 纯修饰符序列，视为 emoji
+        # 所有剩余字符都是 Symbol/Other 或 Modifier Symbol
+        return all(unicodedata.category(c) in ("So", "Sk") for c in stripped)
 
     # ---- 签到命令 ----
 
@@ -678,18 +869,16 @@ class FeedBotPlugin(MaiBotPlugin):
 
         # 提取昵称
         nickname = _extract_nickname(message)
-        self._ensure_user(user_id, nickname, group_id)
+        await self._ensure_user(user_id, nickname, group_id)
 
-        assert self._db is not None
         uid = self._user_key(user_id, group_id)
 
         # 检查今天是否已签到
         now = time.time()
-        cursor = self._db.execute(
+        row = await self._db_fetchone(
             "SELECT last_sign_time, consecutive_sign_days, total_sign_days FROM users WHERE user_id = ?",
             (uid,),
         )
-        row = cursor.fetchone()
         if not row:
             return False, "用户不存在", True
 
@@ -704,8 +893,6 @@ class FeedBotPlugin(MaiBotPlugin):
             return True, "已签到", True
 
         # 判断是否连续签到
-        from datetime import timedelta
-
         yesterday = today - timedelta(days=1)
         if last_sign_date == yesterday:
             consecutive_days += 1
@@ -723,7 +910,7 @@ class FeedBotPlugin(MaiBotPlugin):
         earned = base + bonus
 
         # 更新数据库
-        self._db.execute(
+        await self._db_execute_commit(
             """
             UPDATE users SET points = points + ?, total_sign_days = ?,
                              consecutive_sign_days = ?, last_sign_time = ?
@@ -731,7 +918,6 @@ class FeedBotPlugin(MaiBotPlugin):
             """,
             (earned, total_days, consecutive_days, now, uid),
         )
-        self._db.commit()
 
         # 构建回复
         lines = [
@@ -769,15 +955,13 @@ class FeedBotPlugin(MaiBotPlugin):
             return False, "群未授权", True
 
         nickname = _extract_nickname(message)
-        self._ensure_user(user_id, nickname, group_id)
+        await self._ensure_user(user_id, nickname, group_id)
 
-        assert self._db is not None
         uid = self._user_key(user_id, group_id)
-        cursor = self._db.execute(
+        row = await self._db_fetchone(
             "SELECT points, total_sign_days, consecutive_sign_days FROM users WHERE user_id = ?",
             (uid,),
         )
-        row = cursor.fetchone()
         if not row:
             return False, "用户不存在", True
 
@@ -810,9 +994,8 @@ class FeedBotPlugin(MaiBotPlugin):
         if not self._check_group_enabled(group_id):
             return False, "群未授权", True
 
-        assert self._db is not None
         prefix = f"{group_id}:"
-        cursor = self._db.execute(
+        rows = await self._db_execute(
             """
             SELECT nickname, user_id, points
             FROM users
@@ -821,7 +1004,6 @@ class FeedBotPlugin(MaiBotPlugin):
             """,
             (prefix + "%",),
         )
-        rows = cursor.fetchall()
 
         if not rows:
             await self.ctx.send.text("暂无积分记录，快来 /签到 吧！", stream_id)
@@ -855,10 +1037,8 @@ class FeedBotPlugin(MaiBotPlugin):
         if not self._check_group_enabled(group_id):
             return False, "群未授权", True
 
-        assert self._db is not None
-
         # 查询全局道具
-        global_cursor = self._db.execute(
+        global_items = await self._db_execute(
             """
             SELECT name, emoji, price, description, category, satiety_bonus
             FROM shop_items
@@ -866,12 +1046,11 @@ class FeedBotPlugin(MaiBotPlugin):
             ORDER BY price ASC
             """
         )
-        global_items = global_cursor.fetchall()
 
         # 查询群内道具
-        group_items = []
+        group_items: list[tuple[Any, ...]] = []
         if group_id:
-            group_cursor = self._db.execute(
+            group_items = await self._db_execute(
                 """
                 SELECT name, emoji, price, description, category, satiety_bonus
                 FROM shop_items
@@ -880,7 +1059,6 @@ class FeedBotPlugin(MaiBotPlugin):
                 """,
                 (group_id,),
             )
-            group_items = group_cursor.fetchall()
 
         if not global_items and not group_items:
             await self.ctx.send.text("商店空空如也～等管理员上架道具吧！", stream_id)
@@ -934,23 +1112,21 @@ class FeedBotPlugin(MaiBotPlugin):
             return False, "缺少道具名", True
 
         nickname = _extract_nickname(message)
-        self._ensure_user(user_id, nickname, group_id)
+        await self._ensure_user(user_id, nickname, group_id)
 
-        assert self._db is not None
         uid = self._user_key(user_id, group_id)
 
         # 查找道具
-        item = self._find_shop_item(item_name, group_id)
+        item = await self._find_shop_item(item_name, group_id)
         if not item:
             await self.ctx.send.text(f"没有找到道具「{item_name}」", stream_id)
             return False, "道具不存在", True
 
         # 检查积分
-        cursor = self._db.execute(
+        row = await self._db_fetchone(
             "SELECT points FROM users WHERE user_id = ?",
             (uid,),
         )
-        row = cursor.fetchone()
         if not row:
             return False, "用户不存在", True
 
@@ -963,11 +1139,11 @@ class FeedBotPlugin(MaiBotPlugin):
             return False, "积分不足", True
 
         # 扣减积分，增加背包
-        self._db.execute(
+        await self._db_execute_commit(
             "UPDATE users SET points = points - ? WHERE user_id = ?",
             (item["price"], uid),
         )
-        self._db.execute(
+        await self._db_execute_commit(
             """
             INSERT INTO user_inventory (user_id, item_id, quantity)
             VALUES (?, ?, 1)
@@ -975,7 +1151,6 @@ class FeedBotPlugin(MaiBotPlugin):
             """,
             (uid, item["item_id"]),
         )
-        self._db.commit()
 
         await self.ctx.send.text(
             f"🛒 购买成功！获得 {item['emoji']}{item['name']} x1\n"
@@ -1002,9 +1177,8 @@ class FeedBotPlugin(MaiBotPlugin):
         if not self._check_group_enabled(group_id):
             return False, "群未授权", True
 
-        assert self._db is not None
         uid = self._user_key(user_id, group_id)
-        cursor = self._db.execute(
+        rows = await self._db_execute(
             """
             SELECT si.name, si.emoji, si.satiety_bonus, inv.quantity
             FROM user_inventory inv
@@ -1014,7 +1188,6 @@ class FeedBotPlugin(MaiBotPlugin):
             """,
             (uid,),
         )
-        rows = cursor.fetchall()
 
         if not rows:
             await self.ctx.send.text("背包空空如也～去 /商店 买点东西吧！", stream_id)
@@ -1056,13 +1229,12 @@ class FeedBotPlugin(MaiBotPlugin):
             return False, "缺少道具名", True
 
         nickname = _extract_nickname(message)
-        self._ensure_user(user_id, nickname, group_id)
+        await self._ensure_user(user_id, nickname, group_id)
 
-        assert self._db is not None
         uid = self._user_key(user_id, group_id)
 
         # 查找背包中的道具
-        cursor = self._db.execute(
+        row = await self._db_fetchone(
             """
             SELECT inv.item_id, inv.quantity, si.name, si.emoji, si.feed_reply_hint,
                    si.satiety_bonus
@@ -1072,7 +1244,6 @@ class FeedBotPlugin(MaiBotPlugin):
             """,
             (uid, item_name),
         )
-        row = cursor.fetchone()
 
         if not row:
             await self.ctx.send.text(
@@ -1083,34 +1254,34 @@ class FeedBotPlugin(MaiBotPlugin):
         item_id, _qty, name, emoji, reply_hint, satiety_bonus = row
 
         # 检查饱食度是否已满
-        current_satiety = self._get_satiety(group_id)
+        current_satiety = await self._get_satiety(group_id)
         if current_satiety >= 100:
             await self.ctx.send.text("我已经吃饱了，吃不下啦～等饿一点再喂我吧！", stream_id)
             return False, "饱食度已满", True
 
         # 扣减背包
-        self._db.execute(
+        await self._db_execute_commit(
             "UPDATE user_inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_id = ?",
             (uid, item_id),
         )
         # 清理数量为0的记录
-        self._db.execute(
+        await self._db_execute_commit(
             "DELETE FROM user_inventory WHERE user_id = ? AND item_id = ? AND quantity <= 0",
             (uid, item_id),
         )
 
         # 增加 bot 饱食度（不超过100）
         new_satiety = min(100.0, current_satiety + satiety_bonus)
-        self._set_satiety(new_satiety, group_id)
+        await self._set_satiety(new_satiety, group_id)
 
         # 更新用户投喂计数
-        self._db.execute(
+        await self._db_execute_commit(
             "UPDATE users SET total_feed_count = total_feed_count + 1 WHERE user_id = ?",
             (uid,),
         )
 
         # 获取最近投喂记录（用于 LLM 生成）
-        recent_cursor = self._db.execute(
+        recent_feeds = await self._db_execute(
             """
             SELECT item_name, item_emoji, reply_text
             FROM feed_records
@@ -1119,7 +1290,6 @@ class FeedBotPlugin(MaiBotPlugin):
             """,
             (uid,),
         )
-        recent_feeds = recent_cursor.fetchall()
 
         # 生成 LLM 回复
         reply = await self._generate_feed_reply(
@@ -1133,7 +1303,7 @@ class FeedBotPlugin(MaiBotPlugin):
 
         # 记录投喂历史
         now = time.time()
-        self._db.execute(
+        await self._db_execute_commit(
             """
             INSERT INTO feed_records (user_id, nickname, group_id, item_id,
                                        item_name, item_emoji, reply_text, created_at)
@@ -1141,7 +1311,6 @@ class FeedBotPlugin(MaiBotPlugin):
             """,
             (uid, nickname, group_id, item_id, name, emoji, reply, now),
         )
-        self._db.commit()
 
         # 发送回复
         display_item = f"{emoji}{name}" if emoji else name
@@ -1168,9 +1337,8 @@ class FeedBotPlugin(MaiBotPlugin):
         if not self._check_group_enabled(group_id):
             return False, "群未授权", True
 
-        assert self._db is not None
         uid = self._user_key(user_id, group_id)
-        cursor = self._db.execute(
+        rows = await self._db_execute(
             """
             SELECT item_name, item_emoji, reply_text, created_at
             FROM feed_records
@@ -1179,7 +1347,6 @@ class FeedBotPlugin(MaiBotPlugin):
             """,
             (uid,),
         )
-        rows = cursor.fetchall()
 
         if not rows:
             await self.ctx.send.text("还没有投喂记录哦～", stream_id)
@@ -1214,7 +1381,7 @@ class FeedBotPlugin(MaiBotPlugin):
         if not self._check_group_enabled(group_id):
             return False, "群未授权", True
 
-        satiety = self._get_satiety(group_id)
+        satiety = await self._get_satiety(group_id)
 
         # 根据饱食度生成状态描述
         if satiety >= 80:
@@ -1248,9 +1415,8 @@ class FeedBotPlugin(MaiBotPlugin):
         if not self._check_group_enabled(group_id):
             return False, "群未授权", True
 
-        assert self._db is not None
         prefix = f"{group_id}:"
-        cursor = self._db.execute(
+        rows = await self._db_execute(
             """
             SELECT u.nickname, u.user_id, u.total_feed_count
             FROM users u
@@ -1259,7 +1425,6 @@ class FeedBotPlugin(MaiBotPlugin):
             """,
             (prefix + "%",),
         )
-        rows = cursor.fetchall()
 
         if not rows:
             await self.ctx.send.text("还没有人投喂过我呢～", stream_id)
@@ -1319,34 +1484,30 @@ class FeedBotPlugin(MaiBotPlugin):
         emoji = ""
         desc = ""
         if rest:
-            import re as _re
-            satiety_match = _re.search(r"饱食度(-?\d+(?:\.\d+)?)", rest)
+            satiety_match = re.search(r"饱食度(-?\d+(?:\.\d+)?)", rest)
             if satiety_match:
                 satiety_bonus = float(satiety_match.group(1))
                 rest = rest[:satiety_match.start()] + rest[satiety_match.end():]
                 rest = rest.strip()
             if rest:
                 tokens = rest.split(None, 1)
-                # 判断第一个token是否为emoji（非ASCII字符且长度短）
                 first = tokens[0]
-                if len(first) <= 2 and not first.isascii():
+                if self._is_likely_emoji(first):
                     emoji = first
                     desc = tokens[1].strip() if len(tokens) > 1 else ""
                 else:
                     desc = rest
 
-        assert self._db is not None
-
         # 检查是否重名
-        cursor = self._db.execute(
+        row = await self._db_fetchone(
             "SELECT 1 FROM shop_items WHERE name = ? AND scope = 'global' AND is_on_sale = 1",
             (name,),
         )
-        if cursor.fetchone():
+        if row:
             await self.ctx.send.text(f"全局道具「{name}」已存在", stream_id)
             return False, "道具已存在", True
 
-        self._db.execute(
+        await self._db_execute_commit(
             """
             INSERT INTO shop_items (name, emoji, description, price, scope, group_id,
                                      is_on_sale, satiety_bonus, created_by, created_at)
@@ -1354,7 +1515,6 @@ class FeedBotPlugin(MaiBotPlugin):
             """,
             (name, emoji, desc, price, satiety_bonus, user_id, time.time()),
         )
-        self._db.commit()
 
         display = f"{emoji}{name}" if emoji else name
         await self.ctx.send.text(
@@ -1390,15 +1550,13 @@ class FeedBotPlugin(MaiBotPlugin):
             await self.ctx.send.text("用法：/投喂管理 全局下架 <道具名>", stream_id)
             return False, "缺少道具名", True
 
-        assert self._db is not None
-        cursor = self._db.execute(
+        rowcount = await self._db_execute_rowcount(
             "UPDATE shop_items SET is_on_sale = 0 WHERE name = ? AND scope = 'global'",
             (item_name,),
         )
-        if cursor.rowcount == 0:
+        if rowcount == 0:
             await self.ctx.send.text(f"未找到全局道具「{item_name}」", stream_id)
             return False, "道具不存在", True
-        self._db.commit()
 
         await self.ctx.send.text(f"✅ 全局道具「{item_name}」已下架", stream_id)
         return True, f"下架全局道具{item_name}", True
@@ -1441,15 +1599,13 @@ class FeedBotPlugin(MaiBotPlugin):
             await self.ctx.send.text("饱食度必须是数字", stream_id)
             return False, "饱食度格式错误", True
 
-        assert self._db is not None
-        cursor = self._db.execute(
+        rowcount = await self._db_execute_rowcount(
             "UPDATE shop_items SET satiety_bonus = ? WHERE name = ? AND is_on_sale = 1",
             (satiety_bonus, item_name),
         )
-        if cursor.rowcount == 0:
+        if rowcount == 0:
             await self.ctx.send.text(f"未找到在售道具「{item_name}」", stream_id)
             return False, "道具不存在", True
-        self._db.commit()
 
         await self.ctx.send.text(f"✅ 道具「{item_name}」饱食度已修改为{satiety_bonus:+}", stream_id)
         return True, f"修改道具饱食度{item_name}", True
@@ -1499,17 +1655,14 @@ class FeedBotPlugin(MaiBotPlugin):
             await self.ctx.send.text("数量必须是整数", stream_id)
             return False, "数量格式错误", True
 
-        assert self._db is not None
-
         # 确保目标用户存在
         uid = self._user_key(target_user, effective_group)
-        self._ensure_user(target_user, "", effective_group)
+        await self._ensure_user(target_user, "", effective_group)
 
-        self._db.execute(
+        await self._db_execute_commit(
             "UPDATE users SET points = MAX(0, points + ?) WHERE user_id = ?",
             (amount, uid),
         )
-        self._db.commit()
 
         action = "增加" if amount >= 0 else "减少"
         await self.ctx.send.text(
@@ -1559,7 +1712,7 @@ class FeedBotPlugin(MaiBotPlugin):
             await self.ctx.send.text("属性值必须是数字", stream_id)
             return False, "属性值格式错误", True
 
-        self._set_satiety(attr_value, group_id)
+        await self._set_satiety(attr_value, group_id)
 
         await self.ctx.send.text(
             f"✅ 饱食度已设置为 {attr_value:.0f}", stream_id
@@ -1604,16 +1757,14 @@ class FeedBotPlugin(MaiBotPlugin):
             await self.ctx.send.text("需要指定群号：/投喂管理 重置签到 <QQ号> <群号>", stream_id)
             return False, "缺少群号", True
 
-        assert self._db is not None
         uid = self._user_key(target_user, effective_group)
-        self._db.execute(
+        await self._db_execute_commit(
             """
             UPDATE users SET total_sign_days = 0, consecutive_sign_days = 0, last_sign_time = 0
             WHERE user_id = ?
             """,
             (uid,),
         )
-        self._db.commit()
 
         await self.ctx.send.text(f"✅ 已重置 {target_user} 的签到记录", stream_id)
         return True, f"重置签到{target_user}", True
@@ -1699,6 +1850,11 @@ class FeedBotPlugin(MaiBotPlugin):
             await self.ctx.send.text("群聊中只能取消授权当前群的管理员", stream_id)
             return False, "跨群取消授权", True
 
+        # 不允许取消 Bot 管理员的授权
+        if self._is_bot_admin(target_user):
+            await self.ctx.send.text("无法取消Bot管理员的授权", stream_id)
+            return False, "无法取消Bot管理员", True
+
         self._remove_group_admin_from_config(target_group_id, target_user)
 
         await self.ctx.send.text(
@@ -1752,34 +1908,30 @@ class FeedBotPlugin(MaiBotPlugin):
         emoji = ""
         desc = ""
         if rest:
-            import re as _re
-            satiety_match = _re.search(r"饱食度(-?\d+(?:\.\d+)?)", rest)
+            satiety_match = re.search(r"饱食度(-?\d+(?:\.\d+)?)", rest)
             if satiety_match:
                 satiety_bonus = float(satiety_match.group(1))
                 rest = rest[:satiety_match.start()] + rest[satiety_match.end():]
                 rest = rest.strip()
             if rest:
                 tokens = rest.split(None, 1)
-                # 判断第一个token是否为emoji（非ASCII字符且长度短）
                 first = tokens[0]
-                if len(first) <= 2 and not first.isascii():
+                if self._is_likely_emoji(first):
                     emoji = first
                     desc = tokens[1].strip() if len(tokens) > 1 else ""
                 else:
                     desc = rest
 
-        assert self._db is not None
-
         # 检查群内是否重名
-        cursor = self._db.execute(
+        row = await self._db_fetchone(
             "SELECT 1 FROM shop_items WHERE name = ? AND scope = 'group' AND group_id = ? AND is_on_sale = 1",
             (name, group_id),
         )
-        if cursor.fetchone():
+        if row:
             await self.ctx.send.text(f"本群道具「{name}」已存在", stream_id)
             return False, "道具已存在", True
 
-        self._db.execute(
+        await self._db_execute_commit(
             """
             INSERT INTO shop_items (name, emoji, description, price, scope, group_id,
                                      is_on_sale, satiety_bonus, created_by, created_at)
@@ -1787,7 +1939,6 @@ class FeedBotPlugin(MaiBotPlugin):
             """,
             (name, emoji, desc, price, group_id, satiety_bonus, user_id, time.time()),
         )
-        self._db.commit()
 
         display = f"{emoji}{name}" if emoji else name
         await self.ctx.send.text(
@@ -1824,15 +1975,13 @@ class FeedBotPlugin(MaiBotPlugin):
             await self.ctx.send.text("用法：/投喂管理 群下架 <道具名>", stream_id)
             return False, "缺少道具名", True
 
-        assert self._db is not None
-        cursor = self._db.execute(
+        rowcount = await self._db_execute_rowcount(
             "UPDATE shop_items SET is_on_sale = 0 WHERE name = ? AND scope = 'group' AND group_id = ?",
             (item_name, group_id),
         )
-        if cursor.rowcount == 0:
+        if rowcount == 0:
             await self.ctx.send.text(f"未找到本群道具「{item_name}」", stream_id)
             return False, "道具不存在", True
-        self._db.commit()
 
         await self.ctx.send.text(f"✅ 本群道具「{item_name}」已下架", stream_id)
         return True, f"群下架{item_name}", True
@@ -1840,28 +1989,19 @@ class FeedBotPlugin(MaiBotPlugin):
     # ---- 定时任务 ----
 
     async def _attr_decay_loop(self) -> None:
-        """每小时衰减 bot 饱食度。"""
+        """定期应用基于时间的饱食度衰减。"""
         while self._running:
             try:
                 if not self._running or not self._db:
                     break
 
-                satiety_decay = self.config.bot_attr.satiety_decay_rate
-
-                # 衰减每个群的饱食度
-                cursor = self._db.execute(
-                    "SELECT group_id, satiety FROM feed_groups WHERE satiety > 0"
+                rows = await self._db_execute(
+                    "SELECT group_id FROM feed_groups WHERE satiety > 0"
                 )
-                for row in cursor.fetchall():
-                    gid, current = row[0], row[1]
-                    new_val = max(0.0, current - satiety_decay)
-                    self._db.execute(
-                        "UPDATE feed_groups SET satiety = ? WHERE group_id = ?",
-                        (new_val, gid),
-                    )
-                self._db.commit()
+                for (gid,) in rows:
+                    await self._apply_satiety_decay(gid)
 
-                self.ctx.logger.debug(f"饱食度衰减：-{satiety_decay}")
+                self.ctx.logger.debug("饱食度衰减检查完成")
                 await asyncio.sleep(3600)
             except asyncio.CancelledError:
                 break
@@ -1873,80 +2013,92 @@ class FeedBotPlugin(MaiBotPlugin):
         """定期检查饱食度并触发求投喂。"""
         while self._running:
             try:
-                await asyncio.sleep(1800)
                 if not self._running or not self._db:
                     break
 
                 threshold = self.config.bot_attr.seek_feed_threshold
+                cooldown = self.config.bot_attr.seek_feed_cooldown
 
                 # 获取所有群聊天流
                 try:
                     group_streams = await self.ctx.chat.get_group_streams()
-                    if not group_streams:
-                        continue
+                    if group_streams:
+                        for stream in group_streams:
+                            if not isinstance(stream, dict):
+                                continue
 
-                    for stream in group_streams:
-                        if not isinstance(stream, dict):
-                            continue
+                            stream_group_id = str(stream.get("group_id", ""))
+                            stream_session_id = str(stream.get("session_id", ""))
 
-                        stream_group_id = str(stream.get("group_id", ""))
-                        stream_session_id = str(stream.get("session_id", ""))
+                            if not stream_group_id or not stream_session_id:
+                                continue
+                            if not self._is_group_enabled(stream_group_id):
+                                continue
 
-                        if not stream_group_id or not stream_session_id:
-                            continue
-                        if not self._is_group_enabled(stream_group_id):
-                            continue
+                            # 获取该群的饱食度（已含衰减补偿）
+                            satiety = await self._get_satiety(stream_group_id)
+                            if satiety >= threshold:
+                                continue
 
-                        # 获取该群的饱食度
-                        satiety = self._get_satiety(stream_group_id)
-                        if satiety >= threshold:
-                            continue
+                            # 检查冷却时间
+                            row = await self._db_fetchone(
+                                "SELECT last_seek_feed_time FROM feed_groups WHERE group_id = ?",
+                                (stream_group_id,),
+                            )
+                            last_seek_time = row[0] if row else 0
+                            if time.time() - last_seek_time < cooldown:
+                                continue
 
-                        # 根据饱食度生成求喂消息
-                        if satiety < 10:
-                            seek_msg = "呜呜...好饿好饿...有没有人投喂我呀？🥺"
-                        elif satiety < 20:
-                            seek_msg = "肚子咕咕叫了...能投喂我一些吃的吗？😢"
-                        elif satiety < 30:
-                            seek_msg = "有点想吃东西了...有人愿意投喂我吗？🥺"
-                        else:
-                            seek_msg = "虽然还不算太饿，但如果有人投喂我就好了~"
+                            # 根据饱食度生成求喂消息
+                            if satiety < 10:
+                                seek_msg = "呜呜...好饿好饿...有没有人投喂我呀？🥺"
+                            elif satiety < 20:
+                                seek_msg = "肚子咕咕叫了...能投喂我一些吃的吗？😢"
+                            elif satiety < 30:
+                                seek_msg = "有点想吃东西了...有人愿意投喂我吗？🥺"
+                            else:
+                                seek_msg = "虽然还不算太饿，但如果有人投喂我就好了~"
 
-                        # 如果开启了 LLM，尝试生成更自然的求喂消息
-                        if self.config.llm.enabled:
-                            try:
-                                seek_prompt_parts = [
-                                    f"你是一个可爱的聊天机器人，当前饱食度{satiety:.0f}/100，很饿。",
-                                    "请用1-2句简短的语气向群友们撒娇求投喂，可以包含emoji。",
-                                    "不要重复之前的求喂方式，要多样化。严格遵循你的表达风格。",
-                                ]
+                            # 如果开启了 LLM，尝试生成更自然的求喂消息
+                            if self.config.llm.enabled:
                                 try:
-                                    personality = await self.ctx.config.get("personality.personality", "")
-                                    reply_style = await self.ctx.config.get("personality.reply_style", "")
-                                    if personality:
-                                        seek_prompt_parts.append(f"你的人设：{personality}")
-                                    if reply_style:
-                                        seek_prompt_parts.append(f"你的表达风格：{reply_style}")
-                                except Exception:
-                                    pass
-                                llm_result = await self.ctx.llm.generate(
-                                    prompt="\n".join(seek_prompt_parts),
-                                    model=self.config.llm.effective_model,
-                                    temperature=0.9,
-                                    max_tokens=300,
-                                )
-                                if isinstance(llm_result, dict) and llm_result.get("response"):
-                                    generated = llm_result["response"].strip()
-                                    if generated:
-                                        seek_msg = generated
-                            except Exception as e:
-                                self.ctx.logger.warning(f"LLM生成求喂消息失败: {e}")
+                                    seek_prompt_parts = [
+                                        f"你是一个可爱的聊天机器人，当前饱食度{satiety:.0f}/100，很饿。",
+                                        "请用1-2句简短的语气向群友们撒娇求投喂，可以包含emoji。",
+                                        "不要重复之前的求喂方式，要多样化。严格遵循你的表达风格。",
+                                    ]
+                                    try:
+                                        personality = await self.ctx.config.get("personality.personality", "")
+                                        reply_style = await self.ctx.config.get("personality.reply_style", "")
+                                        if personality:
+                                            seek_prompt_parts.append(f"你的人设：{personality}")
+                                        if reply_style:
+                                            seek_prompt_parts.append(f"你的表达风格：{reply_style}")
+                                    except Exception:
+                                        pass
+                                    llm_result = await self.ctx.llm.generate(
+                                        prompt="\n".join(seek_prompt_parts),
+                                        model=self.config.llm.effective_model,
+                                        temperature=0.9,
+                                        max_tokens=300,
+                                    )
+                                    if isinstance(llm_result, dict) and llm_result.get("response"):
+                                        generated = llm_result["response"].strip()
+                                        if generated:
+                                            seek_msg = generated
+                                except Exception as e:
+                                    self.ctx.logger.warning(f"LLM生成求喂消息失败: {e}")
 
-                        # 发送求喂消息
-                        try:
-                            await self.ctx.send.text(seek_msg, stream_session_id)
-                        except Exception as e:
-                            self.ctx.logger.warning(f"群{stream_group_id}发送求喂消息失败: {e}")
+                            # 发送求喂消息
+                            try:
+                                await self.ctx.send.text(seek_msg, stream_session_id)
+                                # 更新最后求喂时间
+                                await self._db_execute_commit(
+                                    "UPDATE feed_groups SET last_seek_feed_time = ? WHERE group_id = ?",
+                                    (time.time(), stream_group_id),
+                                )
+                            except Exception as e:
+                                self.ctx.logger.warning(f"群{stream_group_id}发送求喂消息失败: {e}")
 
                 except Exception as e:
                     self.ctx.logger.error(f"获取群聊天流失败: {e}")
@@ -1956,6 +2108,11 @@ class FeedBotPlugin(MaiBotPlugin):
             except Exception as e:
                 self.ctx.logger.error(f"求投喂任务异常: {e}")
                 await asyncio.sleep(60)
+                continue
+
+            # 检查完毕后再 sleep
+            if self._running:
+                await asyncio.sleep(1800)
 
     # ---- LLM 回复生成 ----
 
@@ -1975,7 +2132,7 @@ class FeedBotPlugin(MaiBotPlugin):
         # 构造最近投喂历史摘要
         recent_text = ""
         if recent_feeds:
-            parts = []
+            parts: list[str] = []
             for feed_name, feed_emoji, feed_reply in recent_feeds:
                 display = f"{feed_emoji}{feed_name}" if feed_emoji else feed_name
                 short = feed_reply[:20] + "..." if feed_reply and len(feed_reply) > 20 else (feed_reply or "")
