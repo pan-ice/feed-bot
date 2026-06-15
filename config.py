@@ -1,0 +1,96 @@
+"""投喂插件 — 配置模型。"""
+
+from __future__ import annotations
+
+from maibot_sdk import Field, PluginConfigBase
+
+
+class PluginSectionConfig(PluginConfigBase):
+    """插件基础配置。"""
+
+    __ui_label__ = "插件"
+    __ui_icon__ = "package"
+    __ui_order__ = 0
+
+    enabled: bool = Field(default=True, description="是否启用投喂插件")
+    config_version: str = Field(default="1.0.0", description="配置版本")
+
+
+class AdminConfig(PluginConfigBase):
+    """管理员配置。"""
+
+    __ui_label__ = "管理员"
+    __ui_icon__ = "shield"
+    __ui_order__ = 1
+
+    admin_users: list[str] = Field(default_factory=list, description="Bot管理员QQ号列表")
+
+
+class SignConfig(PluginConfigBase):
+    """签到配置。"""
+
+    __ui_label__ = "签到"
+    __ui_icon__ = "calendar-check"
+    __ui_order__ = 2
+
+    base_points: int = Field(default=10, description="签到基础积分")
+    consecutive_bonus: int = Field(default=5, description="连续签到额外奖励（每天递增）")
+    max_consecutive_bonus: int = Field(default=50, description="连续签到奖励上限")
+
+
+class BotAttrConfig(PluginConfigBase):
+    """Bot属性配置。"""
+
+    __ui_label__ = "Bot属性"
+    __ui_icon__ = "heart"
+    __ui_order__ = 3
+
+    initial_satiety: float = Field(default=80.0, description="初始饱食度（0-100）")
+    satiety_decay_rate: float = Field(default=0.5, description="饱食度每小时衰减量")
+    seek_feed_threshold: float = Field(default=30.0, description="饱食度低于此值触发求投喂")
+    seek_feed_cooldown: float = Field(
+        default=7200.0, description="求投喂消息冷却时间（秒，默认2小时）"
+    )
+
+
+class FilterConfig(PluginConfigBase):
+    """触发控制配置。"""
+
+    __ui_label__ = "触发控制"
+    __ui_icon__ = "filter"
+    __ui_order__ = 4
+
+    group_admins: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="群管理员配置，每项包含 group_id（群号）和 admin_users（管理员QQ，空格/逗号/|分隔）",
+    )
+
+
+class LLMConfig(PluginConfigBase):
+    """LLM回复配置。"""
+
+    __ui_label__ = "LLM回复"
+    __ui_icon__ = "brain"
+    __ui_order__ = 5
+
+    enabled: bool = Field(default=True, description="是否使用LLM生成投喂回复")
+    model: str = Field(default="replyer", description="LLM模型任务名（默认使用MaiBot的replyer模型）")
+    temperature: float = Field(default=0.8, description="LLM温度（越高越随机）")
+    max_tokens: int = Field(default=300, description="LLM最大token数（含reasoning token）")
+    fallback_reply: str = Field(default="谢谢你投喂我！好开心~", description="LLM不可用时的兜底回复")
+
+    @property
+    def effective_model(self) -> str:
+        """获取实际使用的模型任务名，空字符串时默认使用 replyer。"""
+        return self.model.strip() or "replyer"
+
+
+class FeedBotConfig(PluginConfigBase):
+    """投喂插件配置。"""
+
+    plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
+    admin: AdminConfig = Field(default_factory=AdminConfig)
+    sign: SignConfig = Field(default_factory=SignConfig)
+    bot_attr: BotAttrConfig = Field(default_factory=BotAttrConfig)
+    filter: FilterConfig = Field(default_factory=FilterConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
