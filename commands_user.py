@@ -447,7 +447,9 @@ class UserCommandsMixin:
             item_name=name,
             item_emoji=emoji,
             feed_reply_hint=reply_hint,
-            satiety=new_satiety,
+            satiety_before=current_satiety,
+            satiety_after=new_satiety,
+            satiety_bonus=satiety_bonus,
             recent_feeds=recent_feeds,
         )
 

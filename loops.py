@@ -152,7 +152,9 @@ class LoopTasksMixin:
         item_name: str,
         item_emoji: str,
         feed_reply_hint: str,
-        satiety: float,
+        satiety_before: float,
+        satiety_after: float,
+        satiety_bonus: float,
         recent_feeds: list[tuple[Any, ...]],
     ) -> str:
         """根据投喂上下文生成个性化回复。"""
@@ -172,7 +174,8 @@ class LoopTasksMixin:
         # 构造 prompt
         prompt_parts = [
             f"你是一个可爱的聊天机器人，刚刚被{user_nickname}投喂了{item_emoji}{item_name}。",
-            f"当前你的状态：饱食度{satiety:.0f}/100。",
+            f"投喂前饱食度{satiety_before:.0f}/100，投喂后{satiety_after:.0f}/100（增加了{satiety_bonus:.0f}）。",
+            "不要在回复中重复饱食度数值，只需自然地表达感受即可。",
         ]
         # 尝试获取 bot 人设和表达风格
         try:
