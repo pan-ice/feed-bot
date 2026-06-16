@@ -44,47 +44,61 @@ class UserCommandsMixin:
 
         uid = self.db.user_key(user_id, group_id)
 
-        now = time.time()
-        row = await self.db.fetchone(
-            "SELECT last_sign_time, consecutive_sign_days, total_sign_days FROM users WHERE user_id = ?",
-            (uid,),
-        )
-        if not row:
+        # 在事务中原子完成：读取签到状态 + 判断 + 更新，防止 TOCTOU
+        def _sign_tx(cursor: Any) -> tuple[bool, int, int, int, int] | None:
+            now_ts = time.time()
+            cursor.execute(
+                "SELECT last_sign_time, consecutive_sign_days, total_sign_days FROM users WHERE user_id = ?",
+                (uid,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None  # 用户不存在
+
+            last_sign_time, consecutive_days, total_days = row
+
+            today = datetime.fromtimestamp(now_ts).date()
+            last_sign_date = datetime.fromtimestamp(last_sign_time).date() if last_sign_time > 0 else None
+
+            if last_sign_date == today:
+                return (False, 0, consecutive_days, total_days, 0)  # 已签到
+
+            yesterday = today - timedelta(days=1)
+            if last_sign_date == yesterday:
+                consecutive_days += 1
+            else:
+                consecutive_days = 1
+
+            total_days += 1
+
+            base = self.config.sign.base_points
+            bonus = min(
+                (consecutive_days - 1) * self.config.sign.consecutive_bonus,
+                self.config.sign.max_consecutive_bonus,
+            )
+            earned = base + bonus
+
+            cursor.execute(
+                """
+                UPDATE users SET points = points + ?, total_sign_days = ?,
+                                 consecutive_sign_days = ?, last_sign_time = ?
+                WHERE user_id = ?
+                """,
+                (earned, total_days, consecutive_days, now_ts, uid),
+            )
+            return (True, earned, consecutive_days, total_days, bonus)
+
+        result = await self.db.run_in_transaction(_sign_tx)
+
+        if result is None:
             return False, "用户不存在", True
 
-        last_sign_time, consecutive_days, total_days = row
-
-        today = datetime.fromtimestamp(now).date()
-        last_sign_date = datetime.fromtimestamp(last_sign_time).date() if last_sign_time > 0 else None
-
-        if last_sign_date == today:
+        signed, earned, consecutive_days, total_days, bonus = result
+        if not signed:
             await self.ctx.send.text("你今天已经签到过了～明天再来吧！", stream_id)
             return True, "已签到", True
 
-        yesterday = today - timedelta(days=1)
-        if last_sign_date == yesterday:
-            consecutive_days += 1
-        else:
-            consecutive_days = 1
-
-        total_days += 1
-
         base = self.config.sign.base_points
-        bonus = min(
-            (consecutive_days - 1) * self.config.sign.consecutive_bonus,
-            self.config.sign.max_consecutive_bonus,
-        )
-        earned = base + bonus
-
-        await self.db.execute_commit(
-            """
-            UPDATE users SET points = points + ?, total_sign_days = ?,
-                             consecutive_sign_days = ?, last_sign_time = ?
-            WHERE user_id = ?
-            """,
-            (earned, total_days, consecutive_days, now, uid),
-        )
-
         lines = [
             f"✅ 签到成功！",
             f"💰 获得积分：{earned}（基础{base} + 连续奖励{bonus}）",
@@ -290,7 +304,7 @@ class UserCommandsMixin:
                 (item["price"], uid, item["price"]),
             )
             if cursor.rowcount == 0:
-                return 0  # 积分不足
+                return -1  # 积分不足
             # 加背包
             cursor.execute(
                 """
@@ -306,12 +320,11 @@ class UserCommandsMixin:
                 (uid,),
             )
             row = cursor.fetchone()
-            remaining = row[0] if row else 0
-            return remaining
+            return row[0] if row else 0
 
         result = await self.db.run_in_transaction(_buy_tx)
 
-        if result == 0:
+        if result < 0:
             # 查询当前积分用于提示
             row = await self.db.fetchone(
                 "SELECT points FROM users WHERE user_id = ?",

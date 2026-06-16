@@ -34,11 +34,25 @@ class AsyncDatabase:
 
     def open(self) -> None:
         """打开数据库连接并初始化表结构（同步，由 asyncio.to_thread 调用）。"""
-        self._db = sqlite3.connect(DB_PATH, check_same_thread=False)
+        # isolation_level=None 关闭 Python 自动事务管理，由代码手动控制 BEGIN/COMMIT/ROLLBACK
+        # 避免手动 BEGIN 与 Python 隐式事务冲突导致 OperationalError
+        self._db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
-        self._init_tables()
-        self._init_bot_attributes()
-        self._migrate_per_group_data()
+        try:
+            self._db.execute("BEGIN")
+            self._init_tables()
+            self._init_bot_attributes()
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
+        # 迁移单独一个事务，失败不影响建表
+        try:
+            self._migrate_per_group_data()
+        except Exception as e:
+            # 迁移失败不应阻塞加载，记录错误后继续
+            import logging
+            logging.getLogger(__name__).error(f"数据迁移失败: {e}")
 
     def close(self) -> None:
         """关闭数据库连接（同步，由 asyncio.to_thread 调用）。"""
@@ -83,28 +97,30 @@ class AsyncDatabase:
     async def execute_commit(
         self, sql: str, params: tuple[Any, ...] | list[Any] = ()
     ) -> None:
-        """线程安全地执行 SQL 并提交。"""
+        """线程安全地执行 SQL 并提交（单语句事务）。"""
 
         def _do() -> None:
             if self._db is None:
                 raise RuntimeError("数据库未初始化")
             with self._lock:
+                self._db.execute("BEGIN")
                 self._db.execute(sql, params)
-                self._db.commit()
+                self._db.execute("COMMIT")
 
         await asyncio.to_thread(_do)
 
     async def execute_rowcount(
         self, sql: str, params: tuple[Any, ...] | list[Any] = ()
     ) -> int:
-        """线程安全地执行 UPDATE/DELETE 并返回影响行数。"""
+        """线程安全地执行 UPDATE/DELETE 并返回影响行数（单语句事务）。"""
 
         def _do() -> int:
             if self._db is None:
                 raise RuntimeError("数据库未初始化")
             with self._lock:
+                self._db.execute("BEGIN")
                 cursor = self._db.execute(sql, params)
-                self._db.commit()
+                self._db.execute("COMMIT")
                 return cursor.rowcount
 
         return await asyncio.to_thread(_do)
@@ -116,22 +132,23 @@ class AsyncDatabase:
             if self._db is None:
                 raise RuntimeError("数据库未初始化")
             with self._lock:
-                self._db.commit()
+                self._db.execute("COMMIT")
 
         await asyncio.to_thread(_do)
 
     async def execute_many(
         self, sql: str, params_seq: list[tuple[Any, ...]]
     ) -> None:
-        """线程安全地执行多条 SQL 并提交。"""
+        """线程安全地执行多条 SQL 并提交（多语句事务）。"""
 
         def _do() -> None:
             if self._db is None:
                 raise RuntimeError("数据库未初始化")
             with self._lock:
+                self._db.execute("BEGIN")
                 for params in params_seq:
                     self._db.execute(sql, params)
-                self._db.commit()
+                self._db.execute("COMMIT")
 
         await asyncio.to_thread(_do)
 
@@ -275,8 +292,6 @@ class AsyncDatabase:
         except sqlite3.OperationalError:
             pass  # 列已存在
 
-        self._db.commit()
-
     def _init_bot_attributes(self) -> None:
         """初始化 bot 属性（如果不存在）。"""
         assert self._db is not None
@@ -294,7 +309,6 @@ class AsyncDatabase:
                     "INSERT INTO bot_attributes (attr_key, attr_value, last_update_time) VALUES (?, ?, ?)",
                     (attr_key, attr_value, ts),
                 )
-        self._db.commit()
 
     def _migrate_per_group_data(self) -> None:
         """将旧的无群号前缀的用户数据迁移为带群号前缀的格式。"""
@@ -428,7 +442,7 @@ class AsyncDatabase:
             if self._db is None:
                 raise RuntimeError("数据库未初始化")
             with self._lock:
-                # 使用 CASE 表达式逐行计算衰减，因为 last_decay_time 各行不同
+                self._db.execute("BEGIN")
                 self._db.execute(
                     """
                     UPDATE feed_groups
@@ -443,7 +457,7 @@ class AsyncDatabase:
                     "UPDATE feed_groups SET last_decay_time = ? WHERE last_decay_time = 0 AND satiety >= 0",
                     (now,),
                 )
-                self._db.commit()
+                self._db.execute("COMMIT")
 
         await asyncio.to_thread(_do)
 
@@ -455,6 +469,7 @@ class AsyncDatabase:
             if self._db is None:
                 raise RuntimeError("数据库未初始化")
             with self._lock:
+                self._db.execute("BEGIN")
                 self._db.execute(
                     """
                     UPDATE bot_attributes
@@ -464,7 +479,7 @@ class AsyncDatabase:
                     """,
                     (decay_rate, now, now),
                 )
-                self._db.commit()
+                self._db.execute("COMMIT")
 
         await asyncio.to_thread(_do)
 
@@ -519,7 +534,7 @@ class AsyncDatabase:
                 VALUES (?, 1, ?, 0, ?, ?)
                 ON CONFLICT(group_id) DO UPDATE SET satiety = ?, last_decay_time = ?
                 """,
-                (group_id, value, now, time.time(), value, now),
+                (group_id, value, now, now, value, now),
             )
         else:
             await self.execute_commit(

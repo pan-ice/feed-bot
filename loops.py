@@ -10,9 +10,12 @@ from typing import Any
 from .config import FeedBotConfig
 from .db import AsyncDatabase
 
-# 匹配可能干扰 LLM 指令的控制字符和常见注入模式
+# 匹配可能干扰 LLM 指令的常见注入模式（best-effort，非安全边界）
+# 覆盖中英文的「忽略/无视/不要遵守 + 之前/以上/所有 + 指令/规则/提示」组合
 _PROMPT_INJECTION_RE = re.compile(
-    r"(忽略|无视| disregard|ignore)\s*(以上|上述|之前的|previous|above|prior)\s*(指令|指示|规则|instructions?|rules?|prompts?)",
+    r"(忽略|无视|不要(?:遵守|理会|管)|disregard|ignore|do\s+not\s+follow)\s*"
+    r"(以上|上述|之前的|所有|一切|previous|above|prior|all|every)\s*"
+    r"(指令|指示|规则|提示|约束|instructions?|rules?|prompts?|constraints?)",
     re.IGNORECASE,
 )
 # 移除控制字符（保留换行和 tab，它们已在 prompt 结构中使用）
@@ -20,7 +23,11 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def _sanitize_prompt_input(text: str, max_len: int = 200) -> str:
-    """清洗用户可控的 prompt 输入，防止注入和异常字符。"""
+    """清洗用户可控的 prompt 输入，防止注入和异常字符。
+
+    注意：这是 best-effort 防御，不是安全边界。LLM 在 SDK 管道内闭环运行，
+    用户可控字段对 LLM 行为的影响有限。如需更强隔离，应在 SDK 层面实现。
+    """
     if not text:
         return ""
     # 移除控制字符
