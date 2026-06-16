@@ -531,6 +531,47 @@ class AdminCommandsMixin:
         )
         return True, f"取消授权{target_user}", True
 
+    @Command(
+        "admin_list_groups",
+        description="查看已授权的群及管理员（管理员）",
+        pattern=r"^/投喂管理\s+群列表$",
+    )
+    async def handle_admin_list_groups(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /投喂管理 群列表 命令，显示所有已配置群及其管理员。"""
+        del kwargs
+
+        if group_id:
+            if not await self._is_group_admin(group_id, user_id):
+                await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
+                return False, "非管理员", True
+        elif not self._is_bot_admin(user_id):
+            await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
+            return False, "非管理员", True
+
+        # 从配置获取已启用的群列表
+        enabled_groups = self._enabled_group_ids()
+        if not enabled_groups:
+            await self.ctx.send.text("暂无已授权的群", stream_id)
+            return True, "无授权群", True
+
+        lines = ["📋 已授权群列表"]
+        for gid in sorted(enabled_groups):
+            admins = await self.db.get_group_admins(gid)
+            if admins:
+                admin_str = ", ".join(admins)
+            else:
+                admin_str = "（无管理员）"
+            lines.append(f"  群 {gid}：{admin_str}")
+
+        await self.ctx.send.text("\n".join(lines), stream_id)
+        return True, "群列表", True
+
     # ---- 群管理员命令 ----
 
     @Command(
