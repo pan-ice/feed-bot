@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import time
 from typing import Any
@@ -11,7 +10,7 @@ from maibot_sdk import Command
 
 from .config import FeedBotConfig
 from .db import AsyncDatabase
-from .utils import PLUGIN_DIR, atomic_write, extract_nickname, is_likely_emoji
+from .utils import extract_nickname, is_likely_emoji
 
 
 class AdminCommandsMixin:
@@ -27,23 +26,12 @@ class AdminCommandsMixin:
         """判断是否为Bot管理员。"""
         return user_id in self.config.admin.admin_users
 
-    def _is_group_admin(self, group_id: str, user_id: str) -> bool:
-        """判断是否为指定群的管理员（含Bot管理员）。"""
+    async def _is_group_admin(self, group_id: str, user_id: str) -> bool:
+        """判断是否为指定群的管理员（含Bot管理员）。从数据库读取运行时授权。"""
         if self._is_bot_admin(user_id):
             return True
-        for item in self.config.filter.group_admins:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("group_id", "")) == group_id:
-                raw = str(item.get("admin_users", "") or "")
-                if user_id in self._parse_admin_list(raw):
-                    return True
-        return False
-
-    @staticmethod
-    def _parse_admin_list(raw: str) -> list[str]:
-        """解析管理员列表字符串，支持空格、逗号、|分隔。"""
-        return [s.strip() for s in raw.replace(",", " ").replace("|", " ").split() if s.strip()]
+        admins = await self.db.get_group_admins(group_id)
+        return user_id in admins
 
     def _enabled_group_ids(self) -> set[str]:
         """返回配置中授权的所有群号。"""
@@ -65,101 +53,31 @@ class AdminCommandsMixin:
             return False
         return True
 
-    # ---- 配置持久化 ----
+    # ---- 内存配置同步（不写 config.toml） ----
 
-    @staticmethod
-    def _toml_escape(s: str) -> str:
-        """转义 TOML 基本字符串中的特殊字符。"""
-        return (
-            s.replace("\\", "\\\\")
-             .replace('"', '\\"')
-             .replace("\n", "\\n")
-             .replace("\r", "\\r")
-             .replace("\t", "\\t")
-        )
-
-    @staticmethod
-    def _toml_list(items: list[str]) -> str:
-        """将字符串列表格式化为 TOML 数组。"""
-        if not items:
-            return "[]"
-        escaped = [f'"{AdminCommandsMixin._toml_escape(i)}"' for i in items]
-        return '[' + ", ".join(escaped) + ']'
-
-    def _save_config_to_file(self) -> None:
-        """将当前配置原子写入 config.toml 文件。"""
-        try:
-            config_path = os.path.join(PLUGIN_DIR, "config.toml")
-            lines: list[str] = []
-            lines.append("[plugin]")
-            lines.append(f"enabled = {'true' if self.config.plugin.enabled else 'false'}")
-            lines.append(f'config_version = "{self._toml_escape(self.config.plugin.config_version)}"')
-            lines.append("")
-            lines.append("[admin]")
-            lines.append(f"admin_users = {self._toml_list(self.config.admin.admin_users)}")
-            lines.append("")
-            lines.append("[sign]")
-            lines.append(f"base_points = {self.config.sign.base_points}")
-            lines.append(f"consecutive_bonus = {self.config.sign.consecutive_bonus}")
-            lines.append(f"max_consecutive_bonus = {self.config.sign.max_consecutive_bonus}")
-            lines.append("")
-            lines.append("[bot_attr]")
-            lines.append(f"initial_satiety = {self.config.bot_attr.initial_satiety}")
-            lines.append(f"satiety_decay_rate = {self.config.bot_attr.satiety_decay_rate}")
-            lines.append(f"seek_feed_threshold = {self.config.bot_attr.seek_feed_threshold}")
-            lines.append(f"seek_feed_cooldown = {self.config.bot_attr.seek_feed_cooldown}")
-            lines.append("")
-            lines.append("[filter]")
-            if self.config.filter.group_admins:
-                for item in self.config.filter.group_admins:
-                    if isinstance(item, dict):
-                        gid = str(item.get("group_id", "") or "")
-                        raw = str(item.get("admin_users", "") or "")
-                        lines.append("[[filter.group_admins]]")
-                        lines.append(f'group_id = "{self._toml_escape(gid)}"')
-                        lines.append(f'admin_users = "{self._toml_escape(raw)}"')
-            else:
-                lines.append("group_admins = []")
-            lines.append("")
-            lines.append("[llm]")
-            lines.append(f"enabled = {'true' if self.config.llm.enabled else 'false'}")
-            lines.append(f'model = "{self._toml_escape(self.config.llm.model)}"')
-            lines.append(f"temperature = {self.config.llm.temperature}")
-            lines.append(f"max_tokens = {self.config.llm.max_tokens}")
-            lines.append(f'fallback_reply = "{self._toml_escape(self.config.llm.fallback_reply)}"')
-            lines.append("")
-
-            with atomic_write(config_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-        except Exception as e:
-            self.ctx.logger.warning(f"保存配置文件失败: {e}")
-
-    def _add_group_admin_to_config(self, target_group_id: str, target_user: str) -> None:
-        """在配置中添加群管理员，若群不存在则创建条目。"""
+    def _add_group_admin_to_memory(self, target_group_id: str, target_user: str) -> None:
+        """在内存配置中添加群管理员（不写文件，仅供 _enabled_group_ids 使用）。"""
         admins = self.config.filter.group_admins
         for item in admins:
             if isinstance(item, dict) and str(item.get("group_id", "")) == target_group_id:
                 raw = str(item.get("admin_users", "") or "")
-                existing = self._parse_admin_list(raw)
+                existing = AsyncDatabase._parse_admin_str(raw)
                 if target_user not in existing:
                     existing.append(target_user)
-                    item["admin_users"] = ", ".join(existing)
-                self._save_config_to_file()
+                    item["admin_users"] = AsyncDatabase._serialize_admin_list(existing)
                 return
         admins.append({"group_id": target_group_id, "admin_users": target_user})
-        self._save_config_to_file()
 
-    def _remove_group_admin_from_config(self, target_group_id: str, target_user: str) -> None:
-        """在配置中移除群管理员。"""
+    def _remove_group_admin_from_memory(self, target_group_id: str, target_user: str) -> None:
+        """在内存配置中移除群管理员（不写文件）。"""
         admins = self.config.filter.group_admins
         for item in admins:
             if isinstance(item, dict) and str(item.get("group_id", "")) == target_group_id:
                 raw = str(item.get("admin_users", "") or "")
-                existing = self._parse_admin_list(raw)
+                existing = AsyncDatabase._parse_admin_str(raw)
                 if target_user in existing:
                     existing.remove(target_user)
-                    item["admin_users"] = ", ".join(existing)
-                self._save_config_to_file()
+                    item["admin_users"] = AsyncDatabase._serialize_admin_list(existing)
                 return
 
     # ---- 道具参数解析 ----
@@ -304,7 +222,7 @@ class AdminCommandsMixin:
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 修改饱食度 命令。"""
         if group_id:
-            if not self._is_group_admin(group_id, user_id):
+            if not await self._is_group_admin(group_id, user_id):
                 await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
                 return False, "非管理员", True
         elif not self._is_bot_admin(user_id):
@@ -368,7 +286,7 @@ class AdminCommandsMixin:
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 积分 命令。"""
         if group_id:
-            if not self._is_group_admin(group_id, user_id):
+            if not await self._is_group_admin(group_id, user_id):
                 await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
                 return False, "非管理员", True
         elif not self._is_bot_admin(user_id):
@@ -426,7 +344,7 @@ class AdminCommandsMixin:
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 属性 命令。"""
         if group_id:
-            if not self._is_group_admin(group_id, user_id):
+            if not await self._is_group_admin(group_id, user_id):
                 await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
                 return False, "非管理员", True
         elif not self._is_bot_admin(user_id):
@@ -481,7 +399,7 @@ class AdminCommandsMixin:
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 重置签到 命令。"""
         if group_id:
-            if not self._is_group_admin(group_id, user_id):
+            if not await self._is_group_admin(group_id, user_id):
                 await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
                 return False, "非管理员", True
         elif not self._is_bot_admin(user_id):
@@ -530,7 +448,7 @@ class AdminCommandsMixin:
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 授权 命令。"""
         if group_id:
-            if not self._is_group_admin(group_id, user_id):
+            if not await self._is_group_admin(group_id, user_id):
                 await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
                 return False, "非管理员", True
         elif not self._is_bot_admin(user_id):
@@ -552,7 +470,10 @@ class AdminCommandsMixin:
             await self.ctx.send.text("群聊中只能授权当前群的管理员", stream_id)
             return False, "跨群授权", True
 
-        self._add_group_admin_to_config(target_group_id, target_user)
+        # 写入数据库（运行时授权）
+        await self.db.add_group_admin(target_group_id, target_user)
+        # 同步更新内存配置（供 _enabled_group_ids 使用）
+        self._add_group_admin_to_memory(target_group_id, target_user)
 
         await self.ctx.send.text(
             f"✅ 已授权 {target_user} 为群 {target_group_id} 的管理员", stream_id
@@ -573,7 +494,7 @@ class AdminCommandsMixin:
     ) -> tuple[bool, str, bool]:
         """处理 /投喂管理 取消授权 命令。"""
         if group_id:
-            if not self._is_group_admin(group_id, user_id):
+            if not await self._is_group_admin(group_id, user_id):
                 await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
                 return False, "非管理员", True
         elif not self._is_bot_admin(user_id):
@@ -600,7 +521,10 @@ class AdminCommandsMixin:
             await self.ctx.send.text("无法取消Bot管理员的授权", stream_id)
             return False, "无法取消Bot管理员", True
 
-        self._remove_group_admin_from_config(target_group_id, target_user)
+        # 从数据库移除（运行时授权）
+        await self.db.remove_group_admin(target_group_id, target_user)
+        # 同步更新内存配置
+        self._remove_group_admin_from_memory(target_group_id, target_user)
 
         await self.ctx.send.text(
             f"✅ 已取消 {target_user} 在群 {target_group_id} 的管理员权限", stream_id
@@ -626,7 +550,7 @@ class AdminCommandsMixin:
             await self.ctx.send.text("群上架仅支持在群聊中使用", stream_id)
             return False, "非群聊", True
 
-        if not self._is_group_admin(group_id, user_id):
+        if not await self._is_group_admin(group_id, user_id):
             await self.ctx.send.text("只有群管理员或Bot管理员才能执行此命令", stream_id)
             return False, "非管理员", True
 
@@ -690,7 +614,7 @@ class AdminCommandsMixin:
             await self.ctx.send.text("群下架仅支持在群聊中使用", stream_id)
             return False, "非群聊", True
 
-        if not self._is_group_admin(group_id, user_id):
+        if not await self._is_group_admin(group_id, user_id):
             await self.ctx.send.text("只有群管理员或Bot管理员才能执行此命令", stream_id)
             return False, "非管理员", True
 

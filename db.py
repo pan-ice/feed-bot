@@ -301,6 +301,14 @@ class AsyncDatabase:
         except sqlite3.OperationalError:
             pass  # 列已存在
 
+        # 迁移：添加 group_admin_users 列（群管理员持久化，替代 config.toml 写入）
+        try:
+            self._db.execute(
+                "ALTER TABLE feed_groups ADD COLUMN group_admin_users TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+
     def _migrate_per_group_data(self) -> None:
         """将旧的无群号前缀的用户数据迁移为带群号前缀的格式。"""
         assert self._db is not None
@@ -538,3 +546,82 @@ class AsyncDatabase:
             "scope": row[8],
             "group_id": row[9],
         }
+
+    # ---- 群管理员持久化 ----
+
+    @staticmethod
+    def _parse_admin_str(raw: str) -> list[str]:
+        """解析逗号/空格分隔的管理员列表字符串。"""
+        return [s.strip() for s in raw.replace(",", " ").split() if s.strip()]
+
+    @staticmethod
+    def _serialize_admin_list(admins: list[str]) -> str:
+        """将管理员列表序列化为逗号分隔字符串。"""
+        return ", ".join(admins)
+
+    async def get_group_admins(self, group_id: str) -> list[str]:
+        """获取群的管理员列表。若群记录不存在则返回空列表。"""
+        row = await self.fetchone(
+            "SELECT group_admin_users FROM feed_groups WHERE group_id = ?",
+            (group_id,),
+        )
+        if row is None or not row[0]:
+            return []
+        return self._parse_admin_str(row[0])
+
+    async def set_group_admins(self, group_id: str, admins: list[str]) -> None:
+        """设置群的管理员列表（覆盖写入）。若群记录不存在则创建。"""
+        raw = self._serialize_admin_list(admins)
+        now = time.time()
+        await self.execute_commit(
+            """
+            INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, group_admin_users, created_at)
+            VALUES (?, 1, -1, 0, 0, ?, ?)
+            ON CONFLICT(group_id) DO UPDATE SET group_admin_users = ?
+            """,
+            (group_id, raw, now, raw),
+        )
+
+    async def add_group_admin(self, group_id: str, user_id: str) -> None:
+        """追加群管理员。若群记录不存在则创建。"""
+        admins = await self.get_group_admins(group_id)
+        if user_id not in admins:
+            admins.append(user_id)
+            await self.set_group_admins(group_id, admins)
+
+    async def remove_group_admin(self, group_id: str, user_id: str) -> None:
+        """移除群管理员。"""
+        admins = await self.get_group_admins(group_id)
+        if user_id in admins:
+            admins.remove(user_id)
+            await self.set_group_admins(group_id, admins)
+
+    async def sync_group_admins_from_config(self, config: FeedBotConfig) -> None:
+        """将 config.toml 中的 group_admins 同步到数据库。
+
+        对每个已配置的群，将 config 中的管理员列表写入 feed_groups.group_admin_users。
+        仅在群记录的 group_admin_users 为空时才写入（避免覆盖运行时 /授权 的变更），
+        除非 config 中有值（WebUI 主动修改时覆盖同步）。
+        """
+        for item in config.filter.group_admins:
+            if not isinstance(item, dict):
+                continue
+            gid = str(item.get("group_id", "") or "").strip()
+            if not gid:
+                continue
+
+            raw = str(item.get("admin_users", "") or "")
+            config_admins = self._parse_admin_str(raw)
+
+            # 确保群记录存在
+            row = await self.fetchone(
+                "SELECT group_admin_users FROM feed_groups WHERE group_id = ?",
+                (gid,),
+            )
+            if row is None:
+                # 群记录不存在，创建并写入管理员
+                await self.set_group_admins(gid, config_admins)
+            elif config_admins:
+                # config 有值，覆盖同步（WebUI 修改时触发 on_config_update）
+                await self.set_group_admins(gid, config_admins)
+            # 若 config_admins 为空且数据库已有值，保留数据库值（不覆盖 /授权 结果）

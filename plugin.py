@@ -43,6 +43,9 @@ class FeedBotPlugin(
         self.db.config = self.config
         await asyncio.to_thread(self.db.open)
 
+        # 将 config.toml 中的群管理员同步到数据库
+        await self.db.sync_group_admins_from_config(self.config)
+
         self._running = True
         self._decay_task = asyncio.create_task(self._attr_decay_loop())
         self._seek_feed_task = asyncio.create_task(self._seek_feed_loop())
@@ -77,9 +80,12 @@ class FeedBotPlugin(
     async def on_config_update(
         self, scope: str, config_data: dict[str, Any], version: str
     ) -> None:
-        """配置热重载时重启后台任务以使用新配置。"""
+        """配置热重载时重启后台任务并同步群管理员到数据库。"""
         if scope != "self":
             return
+
+        # 同步 WebUI / config.toml 中的群管理员变更到数据库
+        await self.db.sync_group_admins_from_config(self.config)
 
         self.ctx.logger.info(f"投喂插件配置已更新 (v{version})，重启后台任务")
 
