@@ -27,7 +27,8 @@
   "capabilities": [
     "send.text",
     "llm.generate",
-    "chat.get_group_streams"
+    "chat.get_group_streams",
+    "config.get"
   ],
   "i18n": {
     "default_locale": "zh-CN",
