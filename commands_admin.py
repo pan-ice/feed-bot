@@ -69,8 +69,14 @@ class AdminCommandsMixin:
 
     @staticmethod
     def _toml_escape(s: str) -> str:
-        """转义 TOML 基本字符串中的特殊字符（反斜杠和双引号）。"""
-        return s.replace("\\", "\\\\").replace('"', '\\"')
+        """转义 TOML 基本字符串中的特殊字符。"""
+        return (
+            s.replace("\\", "\\\\")
+             .replace('"', '\\"')
+             .replace("\n", "\\n")
+             .replace("\r", "\\r")
+             .replace("\t", "\\t")
+        )
 
     @staticmethod
     def _toml_list(items: list[str]) -> str:

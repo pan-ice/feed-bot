@@ -49,15 +49,28 @@ class FeedBotPlugin(
 
         self.ctx.logger.info("投喂插件已加载")
 
-    async def on_unload(self) -> None:
-        """插件卸载时关闭数据库连接和后台任务。"""
-        self._running = False
+    async def _cancel_tasks(self) -> None:
+        """取消并等待后台任务结束。"""
+        tasks = []
         if self._decay_task:
             self._decay_task.cancel()
+            tasks.append(self._decay_task)
             self._decay_task = None
         if self._seek_feed_task:
             self._seek_feed_task.cancel()
+            tasks.append(self._seek_feed_task)
             self._seek_feed_task = None
+        # 等待任务实际结束，避免关闭数据库时仍在操作
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+    async def on_unload(self) -> None:
+        """插件卸载时关闭数据库连接和后台任务。"""
+        self._running = False
+        await self._cancel_tasks()
         await asyncio.to_thread(self.db.close)
         self.ctx.logger.info("投喂插件已卸载")
 
@@ -70,12 +83,7 @@ class FeedBotPlugin(
 
         self.ctx.logger.info(f"投喂插件配置已更新 (v{version})，重启后台任务")
 
-        if self._decay_task:
-            self._decay_task.cancel()
-            self._decay_task = None
-        if self._seek_feed_task:
-            self._seek_feed_task.cancel()
-            self._seek_feed_task = None
+        await self._cancel_tasks()
 
         if self._running and self.db.is_open:
             self._decay_task = asyncio.create_task(self._attr_decay_loop())

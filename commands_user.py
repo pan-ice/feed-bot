@@ -297,10 +297,22 @@ class UserCommandsMixin:
             )
             return False, "积分不足", True
 
-        await self.db.execute_commit(
-            "UPDATE users SET points = points - ? WHERE user_id = ?",
-            (item["price"], uid),
+        # 原子扣除积分（WHERE points >= ? 防止并发导致积分变负）
+        rowcount = await self.db.execute_rowcount(
+            "UPDATE users SET points = points - ? WHERE user_id = ? AND points >= ?",
+            (item["price"], uid, item["price"]),
         )
+        if rowcount == 0:
+            await self.ctx.send.text("积分不足！可能刚消费过，请重试", stream_id)
+            return False, "积分不足", True
+
+        # 查询扣除后的实际积分
+        after_row = await self.db.fetchone(
+            "SELECT points FROM users WHERE user_id = ?",
+            (uid,),
+        )
+        remaining = after_row[0] if after_row else 0
+
         await self.db.execute_commit(
             """
             INSERT INTO user_inventory (user_id, item_id, quantity)
@@ -312,7 +324,7 @@ class UserCommandsMixin:
 
         await self.ctx.send.text(
             f"🛒 购买成功！获得 {item['emoji']}{item['name']} x1\n"
-            f"💰 剩余积分：{current_points - item['price']}",
+            f"💰 剩余积分：{remaining}",
             stream_id,
         )
         return True, f"购买{item_name}", True
