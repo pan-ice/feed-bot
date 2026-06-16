@@ -282,46 +282,49 @@ class UserCommandsMixin:
             await self.ctx.send.text(f"没有找到道具「{item_name}」", stream_id)
             return False, "道具不存在", True
 
-        row = await self.db.fetchone(
-            "SELECT points FROM users WHERE user_id = ?",
-            (uid,),
-        )
-        if not row:
-            return False, "用户不存在", True
+        # 在事务中原子完成：扣积分 + 加背包
+        def _buy_tx(cursor: Any) -> int:
+            # 扣积分（WHERE points >= ? 防止并发导致积分变负）
+            cursor.execute(
+                "UPDATE users SET points = points - ? WHERE user_id = ? AND points >= ?",
+                (item["price"], uid, item["price"]),
+            )
+            if cursor.rowcount == 0:
+                return 0  # 积分不足
+            # 加背包
+            cursor.execute(
+                """
+                INSERT INTO user_inventory (user_id, item_id, quantity)
+                VALUES (?, ?, 1)
+                ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + 1
+                """,
+                (uid, item["item_id"]),
+            )
+            # 查询扣除后的实际积分
+            cursor.execute(
+                "SELECT points FROM users WHERE user_id = ?",
+                (uid,),
+            )
+            row = cursor.fetchone()
+            remaining = row[0] if row else 0
+            return remaining
 
-        current_points = row[0]
-        if current_points < item["price"]:
+        result = await self.db.run_in_transaction(_buy_tx)
+
+        if result == 0:
+            # 查询当前积分用于提示
+            row = await self.db.fetchone(
+                "SELECT points FROM users WHERE user_id = ?",
+                (uid,),
+            )
+            current_points = row[0] if row else 0
             await self.ctx.send.text(
                 f"积分不足！{item['emoji']}{item['name']}需要{item['price']}积分，你只有{current_points}积分",
                 stream_id,
             )
             return False, "积分不足", True
 
-        # 原子扣除积分（WHERE points >= ? 防止并发导致积分变负）
-        rowcount = await self.db.execute_rowcount(
-            "UPDATE users SET points = points - ? WHERE user_id = ? AND points >= ?",
-            (item["price"], uid, item["price"]),
-        )
-        if rowcount == 0:
-            await self.ctx.send.text("积分不足！可能刚消费过，请重试", stream_id)
-            return False, "积分不足", True
-
-        # 查询扣除后的实际积分
-        after_row = await self.db.fetchone(
-            "SELECT points FROM users WHERE user_id = ?",
-            (uid,),
-        )
-        remaining = after_row[0] if after_row else 0
-
-        await self.db.execute_commit(
-            """
-            INSERT INTO user_inventory (user_id, item_id, quantity)
-            VALUES (?, ?, 1)
-            ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + 1
-            """,
-            (uid, item["item_id"]),
-        )
-
+        remaining = result
         await self.ctx.send.text(
             f"🛒 购买成功！获得 {item['emoji']}{item['name']} x1\n"
             f"💰 剩余积分：{remaining}",
@@ -422,28 +425,96 @@ class UserCommandsMixin:
 
         item_id, _qty, name, emoji, reply_hint, satiety_bonus = row
 
-        current_satiety = await self.db.get_satiety(group_id, self.config)
-        if current_satiety >= 100:
+        # 在事务中原子完成：扣背包 + 设饱食度(防溢出) + 更新投喂次数 + 插入记录
+        def _feed_tx(cursor: Any) -> tuple[float, float] | None:
+            now_ts = time.time()
+
+            # 1. 获取当前饱食度（含衰减补偿）
+            if group_id:
+                cursor.execute(
+                    "SELECT satiety, last_decay_time FROM feed_groups WHERE group_id = ?",
+                    (group_id,),
+                )
+                fg_row = cursor.fetchone()
+                if fg_row:
+                    current_satiety, last_decay_time = fg_row[0], fg_row[1]
+                    if last_decay_time > 0:
+                        hours_elapsed = (now_ts - last_decay_time) / 3600.0
+                        current_satiety = max(0.0, current_satiety - hours_elapsed * self.config.bot_attr.satiety_decay_rate)
+                else:
+                    current_satiety = self.config.bot_attr.initial_satiety
+            else:
+                cursor.execute(
+                    "SELECT attr_value, last_update_time FROM bot_attributes WHERE attr_key = 'satiety'",
+                )
+                ba_row = cursor.fetchone()
+                if ba_row:
+                    current_satiety, last_update = ba_row[0], ba_row[1]
+                    if last_update > 0:
+                        hours_elapsed = (now_ts - last_update) / 3600.0
+                        current_satiety = max(0.0, current_satiety - hours_elapsed * self.config.bot_attr.satiety_decay_rate)
+                else:
+                    current_satiety = 0.0
+
+            # 2. 饱食度已满则回滚
+            if current_satiety >= 100:
+                return None
+
+            # 3. 扣背包
+            cursor.execute(
+                "UPDATE user_inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_id = ?",
+                (uid, item_id),
+            )
+            cursor.execute(
+                "DELETE FROM user_inventory WHERE user_id = ? AND item_id = ? AND quantity <= 0",
+                (uid, item_id),
+            )
+
+            # 4. 设饱食度
+            new_satiety = min(100.0, current_satiety + satiety_bonus)
+            if group_id:
+                cursor.execute(
+                    """
+                    INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
+                    VALUES (?, 1, ?, 0, ?, ?)
+                    ON CONFLICT(group_id) DO UPDATE SET satiety = ?, last_decay_time = ?
+                    """,
+                    (group_id, new_satiety, now_ts, now_ts, new_satiety, now_ts),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE bot_attributes SET attr_value = ?, last_update_time = ? WHERE attr_key = 'satiety'",
+                    (new_satiety, now_ts),
+                )
+
+            # 5. 更新投喂次数
+            cursor.execute(
+                "UPDATE users SET total_feed_count = total_feed_count + 1 WHERE user_id = ?",
+                (uid,),
+            )
+
+            # 6. 插入投喂记录
+            cursor.execute(
+                """
+                INSERT INTO feed_records (user_id, nickname, group_id, item_id,
+                                           item_name, item_emoji, reply_text, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (uid, nickname, group_id, item_id, name, emoji, "", now_ts),
+            )
+
+            return (current_satiety, new_satiety)
+
+        result = await self.db.run_in_transaction(_feed_tx)
+
+        if result is None:
             await self.ctx.send.text("我已经吃饱了，吃不下啦～等饿一点再喂我吧！", stream_id)
             return False, "饱食度已满", True
 
-        await self.db.execute_commit(
-            "UPDATE user_inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_id = ?",
-            (uid, item_id),
-        )
-        await self.db.execute_commit(
-            "DELETE FROM user_inventory WHERE user_id = ? AND item_id = ? AND quantity <= 0",
-            (uid, item_id),
-        )
+        current_satiety, new_satiety = result
+        satiety_change = new_satiety - current_satiety
 
-        new_satiety = min(100.0, current_satiety + satiety_bonus)
-        await self.db.set_satiety(new_satiety, group_id)
-
-        await self.db.execute_commit(
-            "UPDATE users SET total_feed_count = total_feed_count + 1 WHERE user_id = ?",
-            (uid,),
-        )
-
+        # 生成回复（在事务外，不影响数据一致性）
         recent_feeds = await self.db.execute(
             """
             SELECT item_name, item_emoji, reply_text
@@ -465,18 +536,20 @@ class UserCommandsMixin:
             recent_feeds=recent_feeds,
         )
 
-        now = time.time()
+        # 更新投喂记录的回复文本
         await self.db.execute_commit(
             """
-            INSERT INTO feed_records (user_id, nickname, group_id, item_id,
-                                       item_name, item_emoji, reply_text, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            UPDATE feed_records SET reply_text = ?
+            WHERE user_id = ? AND item_id = ? AND created_at = (
+                SELECT created_at FROM feed_records
+                WHERE user_id = ? AND item_id = ?
+                ORDER BY created_at DESC LIMIT 1
+            )
             """,
-            (uid, nickname, group_id, item_id, name, emoji, reply, now),
+            (reply, uid, item_id, uid, item_id),
         )
 
         display_item = f"{emoji}{name}" if emoji else name
-        satiety_change = new_satiety - current_satiety
         await self.ctx.send.text(
             f"{nickname} 投喂了 {display_item} 给我～饱食度 +{satiety_change:.0f}（{new_satiety:.0f}/100）\n{reply}",
             stream_id,

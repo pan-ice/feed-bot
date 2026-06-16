@@ -135,6 +135,30 @@ class AsyncDatabase:
 
         await asyncio.to_thread(_do)
 
+    async def run_in_transaction(
+        self, func: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        """在单个事务中执行同步函数 func(db_cursor, *args, **kwargs)。
+
+        func 接收 sqlite3.Cursor 作为第一个参数，内部执行多条 SQL，
+       成功自动 COMMIT，异常自动 ROLLBACK。
+        """
+        def _do() -> Any:
+            if self._db is None:
+                raise RuntimeError("数据库未初始化")
+            with self._lock:
+                try:
+                    self._db.execute("BEGIN")
+                    cursor = self._db.cursor()
+                    result = func(cursor, *args, **kwargs)
+                    self._db.execute("COMMIT")
+                    return result
+                except Exception:
+                    self._db.execute("ROLLBACK")
+                    raise
+
+        return await asyncio.to_thread(_do)
+
     # ---- 数据库初始化（同步，仅在 open() 中调用） ----
 
     def _init_tables(self) -> None:
@@ -290,77 +314,78 @@ class AsyncDatabase:
         if not group_ids:
             return
 
-        migrated = False
-        for gid in group_ids:
-            prefix = f"{gid}:"
-            # 跳过已有前缀记录的群
-            cursor = self._db.execute(
-                "SELECT 1 FROM users WHERE user_id LIKE ? LIMIT 1",
-                (prefix + "%",),
-            )
-            if cursor.fetchone():
-                continue
-
-            # 从 feed_records 获取该群投喂过的旧用户（纯QQ号，无冒号前缀）
-            old_users: set[str] = set()
-            cursor = self._db.execute(
-                "SELECT DISTINCT user_id FROM feed_records WHERE group_id = ? AND user_id NOT LIKE ?",
-                (gid, prefix + "%"),
-            )
-            for row in cursor.fetchall():
-                old_users.add(row[0])
-
-            for old_uid in old_users:
-                new_uid = f"{gid}:{old_uid}"
-                # 检查新记录是否已存在
+        try:
+            self._db.execute("BEGIN")
+            for gid in group_ids:
+                prefix = f"{gid}:"
+                # 跳过已有前缀记录的群
                 cursor = self._db.execute(
-                    "SELECT 1 FROM users WHERE user_id = ?",
-                    (new_uid,),
+                    "SELECT 1 FROM users WHERE user_id LIKE ? LIMIT 1",
+                    (prefix + "%",),
                 )
                 if cursor.fetchone():
                     continue
 
-                # 复制 users 记录（不改原记录，因为可能属于其他群）
+                # 从 feed_records 获取该群投喂过的旧用户（纯QQ号，无冒号前缀）
+                old_users: set[str] = set()
                 cursor = self._db.execute(
-                    "SELECT nickname, points, total_sign_days, consecutive_sign_days, last_sign_time, total_feed_count, created_at FROM users WHERE user_id = ?",
-                    (old_uid,),
+                    "SELECT DISTINCT user_id FROM feed_records WHERE group_id = ? AND user_id NOT LIKE ?",
+                    (gid, prefix + "%"),
                 )
-                src = cursor.fetchone()
-                if src:
+                for row in cursor.fetchall():
+                    old_users.add(row[0])
+
+                for old_uid in old_users:
+                    new_uid = f"{gid}:{old_uid}"
+                    # 检查新记录是否已存在
+                    cursor = self._db.execute(
+                        "SELECT 1 FROM users WHERE user_id = ?",
+                        (new_uid,),
+                    )
+                    if cursor.fetchone():
+                        continue
+
+                    # 复制 users 记录（不改原记录，因为可能属于其他群）
+                    cursor = self._db.execute(
+                        "SELECT nickname, points, total_sign_days, consecutive_sign_days, last_sign_time, total_feed_count, created_at FROM users WHERE user_id = ?",
+                        (old_uid,),
+                    )
+                    src = cursor.fetchone()
+                    if src:
+                        self._db.execute(
+                            """
+                            INSERT OR IGNORE INTO users (user_id, nickname, points, total_sign_days,
+                                                          consecutive_sign_days, last_sign_time,
+                                                          total_feed_count, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (new_uid, src[0], src[1], src[2], src[3], src[4], src[5], src[6]),
+                        )
+
+                    # 复制 user_inventory（只复制该群可见的道具）
+                    cursor = self._db.execute(
+                        "SELECT item_id, quantity FROM user_inventory WHERE user_id = ?",
+                        (old_uid,),
+                    )
+                    for inv_row in cursor.fetchall():
+                        self._db.execute(
+                            """
+                            INSERT OR IGNORE INTO user_inventory (user_id, item_id, quantity)
+                            VALUES (?, ?, ?)
+                            """,
+                            (new_uid, inv_row[0], inv_row[1]),
+                        )
+
+                    # 迁移 feed_records（只迁移该群的）
                     self._db.execute(
-                        """
-                        INSERT OR IGNORE INTO users (user_id, nickname, points, total_sign_days,
-                                                      consecutive_sign_days, last_sign_time,
-                                                      total_feed_count, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (new_uid, src[0], src[1], src[2], src[3], src[4], src[5], src[6]),
+                        "UPDATE feed_records SET user_id = ? WHERE user_id = ? AND group_id = ?",
+                        (new_uid, old_uid, gid),
                     )
 
-                # 复制 user_inventory（只复制该群可见的道具）
-                cursor = self._db.execute(
-                    "SELECT item_id, quantity FROM user_inventory WHERE user_id = ?",
-                    (old_uid,),
-                )
-                for inv_row in cursor.fetchall():
-                    self._db.execute(
-                        """
-                        INSERT OR IGNORE INTO user_inventory (user_id, item_id, quantity)
-                        VALUES (?, ?, ?)
-                        """,
-                        (new_uid, inv_row[0], inv_row[1]),
-                    )
-
-                # 迁移 feed_records（只迁移该群的）
-                self._db.execute(
-                    "UPDATE feed_records SET user_id = ? WHERE user_id = ? AND group_id = ?",
-                    (new_uid, old_uid, gid),
-                )
-
-                migrated = True
-
-        if migrated:
-            self._db.commit()
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
 
     # ---- 数据访问方法 ----
 
@@ -395,65 +420,92 @@ class AsyncDatabase:
                 (nickname, uid, nickname),
             )
 
-    async def apply_satiety_decay(self, group_id: str, decay_rate: float) -> float:
-        """基于时间差计算并应用饱食度衰减，返回衰减后的值。"""
-        row = await self.fetchone(
-            "SELECT satiety, last_decay_time FROM feed_groups WHERE group_id = ?",
-            (group_id,),
-        )
-        if row is None:
-            return -1.0  # 群不存在
-
-        satiety, last_decay_time = row[0], row[1]
-
+    async def apply_satiety_decay_batch(self, decay_rate: float) -> None:
+        """批量应用所有群的饱食度衰减（基于时间差），单条 SQL 高效完成。"""
         now = time.time()
-        if last_decay_time > 0:
-            hours_elapsed = (now - last_decay_time) / 3600.0
-            decay = hours_elapsed * decay_rate
-            satiety = max(0.0, satiety - decay)
 
-        await self.execute_commit(
-            "UPDATE feed_groups SET satiety = ?, last_decay_time = ? WHERE group_id = ?",
-            (satiety, now, group_id),
-        )
-        return satiety
+        def _do() -> None:
+            if self._db is None:
+                raise RuntimeError("数据库未初始化")
+            with self._lock:
+                # 使用 CASE 表达式逐行计算衰减，因为 last_decay_time 各行不同
+                self._db.execute(
+                    """
+                    UPDATE feed_groups
+                    SET satiety = MAX(0.0, satiety - (? * (? - last_decay_time) / 3600.0)),
+                        last_decay_time = ?
+                    WHERE satiety > 0 AND last_decay_time > 0
+                    """,
+                    (decay_rate, now, now),
+                )
+                # 兜底：将 last_decay_time=0 的记录初始化为当前时间，避免下次大量衰减
+                self._db.execute(
+                    "UPDATE feed_groups SET last_decay_time = ? WHERE last_decay_time = 0 AND satiety >= 0",
+                    (now,),
+                )
+                self._db.commit()
+
+        await asyncio.to_thread(_do)
+
+    async def apply_satiety_decay_global(self, decay_rate: float) -> None:
+        """应用全局（私聊）饱食度衰减。"""
+        now = time.time()
+
+        def _do() -> None:
+            if self._db is None:
+                raise RuntimeError("数据库未初始化")
+            with self._lock:
+                self._db.execute(
+                    """
+                    UPDATE bot_attributes
+                    SET attr_value = MAX(0.0, attr_value - (? * (? - last_update_time) / 3600.0)),
+                        last_update_time = ?
+                    WHERE attr_key = 'satiety' AND last_update_time > 0
+                    """,
+                    (decay_rate, now, now),
+                )
+                self._db.commit()
+
+        await asyncio.to_thread(_do)
 
     async def get_satiety(self, group_id: str, config: FeedBotConfig) -> float:
-        """获取群饱食度（基于时间差补偿衰减）。如果群未初始化则自动创建记录。"""
+        """获取群饱食度（含衰减补偿，但不写回数据库）。如果群未初始化则自动创建记录。"""
         if group_id:
-            # 先应用基于时间的衰减
-            satiety = await self.apply_satiety_decay(group_id, config.bot_attr.satiety_decay_rate)
-            if satiety >= 0:
-                return satiety
-            # 群未初始化饱食度，自动创建记录并写入初始值
-            initial = config.bot_attr.initial_satiety
-            now = time.time()
-            await self.execute_commit(
-                """
-                INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
-                VALUES (?, 1, ?, 0, ?, ?)
-                ON CONFLICT(group_id) DO UPDATE SET satiety = ?, last_decay_time = ?
-                """,
-                (group_id, initial, now, time.time(), initial, now),
+            row = await self.fetchone(
+                "SELECT satiety, last_decay_time FROM feed_groups WHERE group_id = ?",
+                (group_id,),
             )
-            return initial
+            if row is None:
+                # 群未初始化饱食度，自动创建记录并写入初始值
+                initial = config.bot_attr.initial_satiety
+                now = time.time()
+                await self.execute_commit(
+                    """
+                    INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
+                    VALUES (?, 1, ?, 0, ?, ?)
+                    """,
+                    (group_id, initial, now, now),
+                )
+                return initial
+
+            satiety, last_decay_time = row[0], row[1]
+            # 补偿衰减（仅计算，不写回——写回由衰减循环统一负责）
+            if last_decay_time > 0:
+                hours_elapsed = (time.time() - last_decay_time) / 3600.0
+                satiety = max(0.0, satiety - hours_elapsed * config.bot_attr.satiety_decay_rate)
+            return satiety
+
         # 私聊无群号时，从全局属性读取
         row = await self.fetchone(
             "SELECT attr_value, last_update_time FROM bot_attributes WHERE attr_key = 'satiety'",
         )
         if not row:
             return 0.0
-        # 基于时间差补偿全局饱食度衰减
         satiety, last_update = row[0], row[1]
-        now = time.time()
+        # 补偿衰减（仅计算，不写回）
         if last_update > 0:
-            hours_elapsed = (now - last_update) / 3600.0
-            decay = hours_elapsed * config.bot_attr.satiety_decay_rate
-            satiety = max(0.0, satiety - decay)
-            await self.execute_commit(
-                "UPDATE bot_attributes SET attr_value = ?, last_update_time = ? WHERE attr_key = 'satiety'",
-                (satiety, now),
-            )
+            hours_elapsed = (time.time() - last_update) / 3600.0
+            satiety = max(0.0, satiety - hours_elapsed * config.bot_attr.satiety_decay_rate)
         return satiety
 
     async def set_satiety(self, value: float, group_id: str = "") -> None:

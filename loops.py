@@ -3,11 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any
 
 from .config import FeedBotConfig
 from .db import AsyncDatabase
+
+# 匹配可能干扰 LLM 指令的控制字符和常见注入模式
+_PROMPT_INJECTION_RE = re.compile(
+    r"(忽略|无视| disregard|ignore)\s*(以上|上述|之前的|previous|above|prior)\s*(指令|指示|规则|instructions?|rules?|prompts?)",
+    re.IGNORECASE,
+)
+# 移除控制字符（保留换行和 tab，它们已在 prompt 结构中使用）
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _sanitize_prompt_input(text: str, max_len: int = 200) -> str:
+    """清洗用户可控的 prompt 输入，防止注入和异常字符。"""
+    if not text:
+        return ""
+    # 移除控制字符
+    text = _CONTROL_CHAR_RE.sub("", text)
+    # 截断过长输入
+    if len(text) > max_len:
+        text = text[:max_len] + "…"
+    # 将注入模式替换为占位符
+    text = _PROMPT_INJECTION_RE.sub("[已过滤]", text)
+    return text
 
 
 class LoopTasksMixin:
@@ -21,17 +44,16 @@ class LoopTasksMixin:
     # ---- 定时任务 ----
 
     async def _attr_decay_loop(self) -> None:
-        """定期应用基于时间的饱食度衰减。"""
+        """定期应用基于时间的饱食度衰减（批量 SQL + 全局衰减）。"""
         while self._running:
             try:
                 if not self._running or not self.db.is_open:
                     break
 
-                rows = await self.db.execute(
-                    "SELECT group_id FROM feed_groups WHERE satiety > 0"
-                )
-                for (gid,) in rows:
-                    await self.db.apply_satiety_decay(gid, self.config.bot_attr.satiety_decay_rate)
+                # 批量衰减所有群饱食度
+                await self.db.apply_satiety_decay_batch(self.config.bot_attr.satiety_decay_rate)
+                # 衰减全局（私聊）饱食度
+                await self.db.apply_satiety_decay_global(self.config.bot_attr.satiety_decay_rate)
 
                 self.ctx.logger.debug("饱食度衰减检查完成")
                 await asyncio.sleep(3600)
@@ -171,9 +193,14 @@ class LoopTasksMixin:
                 parts.append(f"{display}" + (f"({short})" if short else ""))
             recent_text = "、".join(parts)
 
-        # 构造 prompt
+        # 构造 prompt（用户可控字段做清洗防注入）
+        safe_nickname = _sanitize_prompt_input(user_nickname)
+        safe_item_name = _sanitize_prompt_input(item_name)
+        safe_hint = _sanitize_prompt_input(feed_reply_hint)
+        safe_recent = _sanitize_prompt_input(recent_text, max_len=500)
+
         prompt_parts = [
-            f"你是一个可爱的聊天机器人，刚刚被{user_nickname}投喂了{item_emoji}{item_name}。",
+            f"你是一个可爱的聊天机器人，刚刚被{safe_nickname}投喂了{item_emoji}{safe_item_name}。",
             f"投喂前饱食度{satiety_before:.0f}/100，投喂后{satiety_after:.0f}/100（增加了{satiety_bonus:.0f}）。",
             "不要在回复中重复饱食度数值，只需自然地表达感受即可。",
         ]
@@ -187,10 +214,10 @@ class LoopTasksMixin:
                 prompt_parts.append(f"你的表达风格：{reply_style}")
         except Exception:
             pass
-        if feed_reply_hint:
-            prompt_parts.append(f"投喂提示：{feed_reply_hint}")
-        if recent_text:
-            prompt_parts.append(f"最近被投喂了：{recent_text}")
+        if safe_hint:
+            prompt_parts.append(f"投喂提示：{safe_hint}")
+        if safe_recent:
+            prompt_parts.append(f"最近被投喂了：{safe_recent}")
         prompt_parts.append("请用简短的语气回应这次投喂，1-2句话即可，可以包含emoji。不要重复之前说过的话。严格遵循你的表达风格。")
 
         prompt = "\n".join(prompt_parts)

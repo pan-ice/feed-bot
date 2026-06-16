@@ -293,7 +293,7 @@ class AdminCommandsMixin:
     @Command(
         "admin_modify_satiety",
         description="修改道具饱食度（管理员）",
-        pattern=r"^/投喂管理\s+修改饱食度\s+(?P<item_name>.+?)\s+(?P<satiety>-?\d+(?:\.\d+)?)$",
+        pattern=r"^/投喂管理\s+修改饱食度\s+(?P<scope>全局|群)\s+(?P<item_name>.+?)\s+(?P<satiety>-?\d+(?:\.\d+)?)$",
     )
     async def handle_admin_modify_satiety(
         self,
@@ -315,11 +315,12 @@ class AdminCommandsMixin:
         if not isinstance(matched_groups, dict):
             matched_groups = {}
 
+        scope = str(matched_groups.get("scope") or "").strip()
         item_name = str(matched_groups.get("item_name") or "").strip()
         satiety_str = str(matched_groups.get("satiety") or "").strip()
 
-        if not item_name or not satiety_str:
-            await self.ctx.send.text("用法：/投喂管理 修改饱食度 <道具名> <饱食度>", stream_id)
+        if not scope or not item_name or not satiety_str:
+            await self.ctx.send.text("用法：/投喂管理 修改饱食度 <全局|群> <道具名> <饱食度>", stream_id)
             return False, "参数缺失", True
 
         try:
@@ -328,15 +329,29 @@ class AdminCommandsMixin:
             await self.ctx.send.text("饱食度必须是数字", stream_id)
             return False, "饱食度格式错误", True
 
-        rowcount = await self.db.execute_rowcount(
-            "UPDATE shop_items SET satiety_bonus = ? WHERE name = ? AND is_on_sale = 1",
-            (satiety_bonus, item_name),
-        )
+        if scope == "全局":
+            rowcount = await self.db.execute_rowcount(
+                "UPDATE shop_items SET satiety_bonus = ? WHERE name = ? AND scope = 'global' AND is_on_sale = 1",
+                (satiety_bonus, item_name),
+            )
+        else:
+            # 群道具：需要群号
+            effective_group = group_id
+            if not effective_group:
+                await self.ctx.send.text("修改群道具饱食度需要在群聊中使用", stream_id)
+                return False, "缺少群号", True
+            rowcount = await self.db.execute_rowcount(
+                "UPDATE shop_items SET satiety_bonus = ? WHERE name = ? AND scope = 'group' AND group_id = ? AND is_on_sale = 1",
+                (satiety_bonus, item_name, effective_group),
+            )
+
         if rowcount == 0:
-            await self.ctx.send.text(f"未找到在售道具「{item_name}」", stream_id)
+            scope_label = "全局" if scope == "全局" else "群内"
+            await self.ctx.send.text(f"未找到{scope_label}在售道具「{item_name}」", stream_id)
             return False, "道具不存在", True
 
-        await self.ctx.send.text(f"✅ 道具「{item_name}」饱食度已修改为{satiety_bonus:+}", stream_id)
+        scope_label = "全局" if scope == "全局" else "群内"
+        await self.ctx.send.text(f"✅ {scope_label}道具「{item_name}」饱食度已修改为{satiety_bonus:+}", stream_id)
         return True, f"修改道具饱食度{item_name}", True
 
     @Command(
