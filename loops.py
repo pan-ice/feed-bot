@@ -51,7 +51,7 @@ class LoopTasksMixin:
     # ---- 定时任务 ----
 
     async def _attr_decay_loop(self) -> None:
-        """定期应用基于时间的饱食度衰减（批量 SQL + 全局衰减）。"""
+        """定期应用基于时间的饱食度衰减（批量 SQL）。"""
         while self._running:
             try:
                 if not self._running or not self.db.is_open:

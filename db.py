@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import threading
 import time
@@ -10,6 +11,15 @@ from typing import Any
 
 from .config import FeedBotConfig
 from .utils import DB_PATH
+
+
+class _Rollback(Exception):
+    """用于在 run_in_transaction 中安全回滚事务的信号异常。
+
+    抛出此异常时，事务会 ROLLBACK（不 COMMIT），run_in_transaction 返回 None。
+    适用于「事务内检测到不需要执行」的场景（如饱食度已满），
+    而非真正的错误——调用方通过检查返回值 None 来区分。
+    """
 
 
 class AsyncDatabase:
@@ -50,7 +60,6 @@ class AsyncDatabase:
             self._migrate_per_group_data()
         except Exception as e:
             # 迁移失败不应阻塞加载，记录错误后继续
-            import logging
             logging.getLogger(__name__).error(f"数据迁移失败: {e}")
 
     def close(self) -> None:
@@ -158,6 +167,7 @@ class AsyncDatabase:
 
         func 接收 sqlite3.Cursor 作为第一个参数，内部执行多条 SQL，
        成功自动 COMMIT，异常自动 ROLLBACK。
+       抛出 _Rollback 时回滚并返回 None（不视为错误）。
         """
         def _do() -> Any:
             if self._db is None:
@@ -169,8 +179,17 @@ class AsyncDatabase:
                     result = func(cursor, *args, **kwargs)
                     self._db.execute("COMMIT")
                     return result
+                except _Rollback:
+                    try:
+                        self._db.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    return None
                 except Exception:
-                    self._db.execute("ROLLBACK")
+                    try:
+                        self._db.execute("ROLLBACK")
+                    except Exception:
+                        pass
                     raise
 
         return await asyncio.to_thread(_do)

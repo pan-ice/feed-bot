@@ -9,7 +9,7 @@ from typing import Any
 from maibot_sdk import Command
 
 from .config import FeedBotConfig
-from .db import AsyncDatabase
+from .db import AsyncDatabase, _Rollback
 from .utils import extract_nickname
 
 
@@ -459,9 +459,9 @@ class UserCommandsMixin:
             else:
                 current_satiety = self.config.bot_attr.initial_satiety
 
-            # 2. 饱食度已满则回滚
+            # 2. 饱食度已满则回滚事务（不扣道具、不写记录）
             if current_satiety >= 100:
-                return None
+                raise _Rollback()
 
             # 3. 扣背包
             cursor.execute(
