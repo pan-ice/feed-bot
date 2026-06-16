@@ -68,11 +68,17 @@ class AdminCommandsMixin:
     # ---- 配置持久化 ----
 
     @staticmethod
+    def _toml_escape(s: str) -> str:
+        """转义 TOML 基本字符串中的特殊字符（反斜杠和双引号）。"""
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    @staticmethod
     def _toml_list(items: list[str]) -> str:
         """将字符串列表格式化为 TOML 数组。"""
         if not items:
             return "[]"
-        return '[' + ", ".join(f'"{i}"' for i in items) + ']'
+        escaped = [f'"{AdminCommandsMixin._toml_escape(i)}"' for i in items]
+        return '[' + ", ".join(escaped) + ']'
 
     def _save_config_to_file(self) -> None:
         """将当前配置原子写入 config.toml 文件。"""
@@ -81,7 +87,7 @@ class AdminCommandsMixin:
             lines: list[str] = []
             lines.append("[plugin]")
             lines.append(f"enabled = {'true' if self.config.plugin.enabled else 'false'}")
-            lines.append(f'config_version = "{self.config.plugin.config_version}"')
+            lines.append(f'config_version = "{self._toml_escape(self.config.plugin.config_version)}"')
             lines.append("")
             lines.append("[admin]")
             lines.append(f"admin_users = {self._toml_list(self.config.admin.admin_users)}")
@@ -104,17 +110,17 @@ class AdminCommandsMixin:
                         gid = str(item.get("group_id", "") or "")
                         raw = str(item.get("admin_users", "") or "")
                         lines.append("[[filter.group_admins]]")
-                        lines.append(f'group_id = "{gid}"')
-                        lines.append(f'admin_users = "{raw}"')
+                        lines.append(f'group_id = "{self._toml_escape(gid)}"')
+                        lines.append(f'admin_users = "{self._toml_escape(raw)}"')
             else:
                 lines.append("group_admins = []")
             lines.append("")
             lines.append("[llm]")
             lines.append(f"enabled = {'true' if self.config.llm.enabled else 'false'}")
-            lines.append(f'model = "{self.config.llm.model}"')
+            lines.append(f'model = "{self._toml_escape(self.config.llm.model)}"')
             lines.append(f"temperature = {self.config.llm.temperature}")
             lines.append(f"max_tokens = {self.config.llm.max_tokens}")
-            lines.append(f'fallback_reply = "{self.config.llm.fallback_reply}"')
+            lines.append(f'fallback_reply = "{self._toml_escape(self.config.llm.fallback_reply)}"')
             lines.append("")
 
             with atomic_write(config_path, "w", encoding="utf-8") as f:
