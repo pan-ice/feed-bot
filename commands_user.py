@@ -403,6 +403,9 @@ class UserCommandsMixin:
         """处理 /投喂 命令。"""
         if not user_id:
             return False, "无法获取用户信息", True
+        if not group_id:
+            await self.ctx.send.text("投喂仅支持群聊使用", stream_id)
+            return False, "非群聊", True
         if not self._check_group_enabled(group_id):
             return False, "群未授权", True
 
@@ -443,31 +446,18 @@ class UserCommandsMixin:
             now_ts = time.time()
 
             # 1. 获取当前饱食度（含衰减补偿）
-            if group_id:
-                cursor.execute(
-                    "SELECT satiety, last_decay_time FROM feed_groups WHERE group_id = ?",
-                    (group_id,),
-                )
-                fg_row = cursor.fetchone()
-                if fg_row:
-                    current_satiety, last_decay_time = fg_row[0], fg_row[1]
-                    if last_decay_time > 0:
-                        hours_elapsed = (now_ts - last_decay_time) / 3600.0
-                        current_satiety = max(0.0, current_satiety - hours_elapsed * self.config.bot_attr.satiety_decay_rate)
-                else:
-                    current_satiety = self.config.bot_attr.initial_satiety
+            cursor.execute(
+                "SELECT satiety, last_decay_time FROM feed_groups WHERE group_id = ?",
+                (group_id,),
+            )
+            fg_row = cursor.fetchone()
+            if fg_row:
+                current_satiety, last_decay_time = fg_row[0], fg_row[1]
+                if last_decay_time > 0:
+                    hours_elapsed = (now_ts - last_decay_time) / 3600.0
+                    current_satiety = max(0.0, current_satiety - hours_elapsed * self.config.bot_attr.satiety_decay_rate)
             else:
-                cursor.execute(
-                    "SELECT attr_value, last_update_time FROM bot_attributes WHERE attr_key = 'satiety'",
-                )
-                ba_row = cursor.fetchone()
-                if ba_row:
-                    current_satiety, last_update = ba_row[0], ba_row[1]
-                    if last_update > 0:
-                        hours_elapsed = (now_ts - last_update) / 3600.0
-                        current_satiety = max(0.0, current_satiety - hours_elapsed * self.config.bot_attr.satiety_decay_rate)
-                else:
-                    current_satiety = 0.0
+                current_satiety = self.config.bot_attr.initial_satiety
 
             # 2. 饱食度已满则回滚
             if current_satiety >= 100:
@@ -485,20 +475,14 @@ class UserCommandsMixin:
 
             # 4. 设饱食度
             new_satiety = min(100.0, current_satiety + satiety_bonus)
-            if group_id:
-                cursor.execute(
-                    """
-                    INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
-                    VALUES (?, 1, ?, 0, ?, ?)
-                    ON CONFLICT(group_id) DO UPDATE SET satiety = ?, last_decay_time = ?
-                    """,
-                    (group_id, new_satiety, now_ts, now_ts, new_satiety, now_ts),
-                )
-            else:
-                cursor.execute(
-                    "UPDATE bot_attributes SET attr_value = ?, last_update_time = ? WHERE attr_key = 'satiety'",
-                    (new_satiety, now_ts),
-                )
+            cursor.execute(
+                """
+                INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
+                VALUES (?, 1, ?, 0, ?, ?)
+                ON CONFLICT(group_id) DO UPDATE SET satiety = ?, last_decay_time = ?
+                """,
+                (group_id, new_satiety, now_ts, now_ts, new_satiety, now_ts),
+            )
 
             # 5. 更新投喂次数
             cursor.execute(
@@ -625,6 +609,9 @@ class UserCommandsMixin:
 
         if not user_id:
             return False, "无法获取用户信息", True
+        if not group_id:
+            await self.ctx.send.text("饱食度仅支持群聊使用", stream_id)
+            return False, "非群聊", True
         if not self._check_group_enabled(group_id):
             return False, "群未授权", True
 
@@ -639,8 +626,7 @@ class UserCommandsMixin:
         else:
             desc = "好饿好饿！快投喂我！"
 
-        scope_hint = "（本群）" if group_id else ""
-        msg = f"🍖 当前饱食度{scope_hint}：{satiety:.0f}/100 — {desc}"
+        msg = f"🍖 当前饱食度（本群）：{satiety:.0f}/100 — {desc}"
         await self.ctx.send.text(msg, stream_id)
         return True, "饱食度", True
 

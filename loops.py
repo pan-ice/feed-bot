@@ -59,8 +59,6 @@ class LoopTasksMixin:
 
                 # 批量衰减所有群饱食度
                 await self.db.apply_satiety_decay_batch(self.config.bot_attr.satiety_decay_rate)
-                # 衰减全局（私聊）饱食度
-                await self.db.apply_satiety_decay_global(self.config.bot_attr.satiety_decay_rate)
 
                 self.ctx.logger.debug("饱食度衰减检查完成")
                 await asyncio.sleep(3600)

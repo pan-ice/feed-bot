@@ -41,7 +41,6 @@ class AsyncDatabase:
         try:
             self._db.execute("BEGIN")
             self._init_tables()
-            self._init_bot_attributes()
             self._db.execute("COMMIT")
         except Exception:
             self._db.execute("ROLLBACK")
@@ -260,15 +259,6 @@ class AsyncDatabase:
         )
         self._db.execute(
             """
-            CREATE TABLE IF NOT EXISTS bot_attributes (
-                attr_key TEXT PRIMARY KEY,
-                attr_value REAL NOT NULL DEFAULT 0,
-                last_update_time REAL NOT NULL
-            )
-            """
-        )
-        self._db.execute(
-            """
             CREATE TABLE IF NOT EXISTS feed_groups (
                 group_id TEXT PRIMARY KEY,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -291,24 +281,6 @@ class AsyncDatabase:
             )
         except sqlite3.OperationalError:
             pass  # 列已存在
-
-    def _init_bot_attributes(self) -> None:
-        """初始化 bot 属性（如果不存在）。"""
-        assert self._db is not None
-        now = time.time()
-        defaults = [
-            ("satiety", self.config.bot_attr.initial_satiety, now),
-        ]
-        for attr_key, attr_value, ts in defaults:
-            cursor = self._db.execute(
-                "SELECT 1 FROM bot_attributes WHERE attr_key = ?",
-                (attr_key,),
-            )
-            if cursor.fetchone() is None:
-                self._db.execute(
-                    "INSERT INTO bot_attributes (attr_key, attr_value, last_update_time) VALUES (?, ?, ?)",
-                    (attr_key, attr_value, ts),
-                )
 
     def _migrate_per_group_data(self) -> None:
         """将旧的无群号前缀的用户数据迁移为带群号前缀的格式。"""
@@ -461,86 +433,44 @@ class AsyncDatabase:
 
         await asyncio.to_thread(_do)
 
-    async def apply_satiety_decay_global(self, decay_rate: float) -> None:
-        """应用全局（私聊）饱食度衰减。"""
-        now = time.time()
-
-        def _do() -> None:
-            if self._db is None:
-                raise RuntimeError("数据库未初始化")
-            with self._lock:
-                self._db.execute("BEGIN")
-                self._db.execute(
-                    """
-                    UPDATE bot_attributes
-                    SET attr_value = MAX(0.0, attr_value - (? * (? - last_update_time) / 3600.0)),
-                        last_update_time = ?
-                    WHERE attr_key = 'satiety' AND last_update_time > 0
-                    """,
-                    (decay_rate, now, now),
-                )
-                self._db.execute("COMMIT")
-
-        await asyncio.to_thread(_do)
-
     async def get_satiety(self, group_id: str, config: FeedBotConfig) -> float:
         """获取群饱食度（含衰减补偿，但不写回数据库）。如果群未初始化则自动创建记录。"""
-        if group_id:
-            row = await self.fetchone(
-                "SELECT satiety, last_decay_time FROM feed_groups WHERE group_id = ?",
-                (group_id,),
-            )
-            if row is None:
-                # 群未初始化饱食度，自动创建记录并写入初始值
-                initial = config.bot_attr.initial_satiety
-                now = time.time()
-                await self.execute_commit(
-                    """
-                    INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
-                    VALUES (?, 1, ?, 0, ?, ?)
-                    """,
-                    (group_id, initial, now, now),
-                )
-                return initial
-
-            satiety, last_decay_time = row[0], row[1]
-            # 补偿衰减（仅计算，不写回——写回由衰减循环统一负责）
-            if last_decay_time > 0:
-                hours_elapsed = (time.time() - last_decay_time) / 3600.0
-                satiety = max(0.0, satiety - hours_elapsed * config.bot_attr.satiety_decay_rate)
-            return satiety
-
-        # 私聊无群号时，从全局属性读取
         row = await self.fetchone(
-            "SELECT attr_value, last_update_time FROM bot_attributes WHERE attr_key = 'satiety'",
+            "SELECT satiety, last_decay_time FROM feed_groups WHERE group_id = ?",
+            (group_id,),
         )
-        if not row:
-            return 0.0
-        satiety, last_update = row[0], row[1]
-        # 补偿衰减（仅计算，不写回）
-        if last_update > 0:
-            hours_elapsed = (time.time() - last_update) / 3600.0
-            satiety = max(0.0, satiety - hours_elapsed * config.bot_attr.satiety_decay_rate)
-        return satiety
-
-    async def set_satiety(self, value: float, group_id: str = "") -> None:
-        """设置饱食度（钳位到 0-100）。"""
-        value = max(0.0, min(100.0, value))
-        now = time.time()
-        if group_id:
+        if row is None:
+            # 群未初始化饱食度，自动创建记录并写入初始值
+            initial = config.bot_attr.initial_satiety
+            now = time.time()
             await self.execute_commit(
                 """
                 INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
                 VALUES (?, 1, ?, 0, ?, ?)
-                ON CONFLICT(group_id) DO UPDATE SET satiety = ?, last_decay_time = ?
                 """,
-                (group_id, value, now, now, value, now),
+                (group_id, initial, now, now),
             )
-        else:
-            await self.execute_commit(
-                "UPDATE bot_attributes SET attr_value = ?, last_update_time = ? WHERE attr_key = 'satiety'",
-                (value, now),
-            )
+            return initial
+
+        satiety, last_decay_time = row[0], row[1]
+        # 补偿衰减（仅计算，不写回——写回由衰减循环统一负责）
+        if last_decay_time > 0:
+            hours_elapsed = (time.time() - last_decay_time) / 3600.0
+            satiety = max(0.0, satiety - hours_elapsed * config.bot_attr.satiety_decay_rate)
+        return satiety
+
+    async def set_satiety(self, value: float, group_id: str) -> None:
+        """设置群饱食度（钳位到 0-100）。"""
+        value = max(0.0, min(100.0, value))
+        now = time.time()
+        await self.execute_commit(
+            """
+            INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
+            VALUES (?, 1, ?, 0, ?, ?)
+            ON CONFLICT(group_id) DO UPDATE SET satiety = ?, last_decay_time = ?
+            """,
+            (group_id, value, now, now, value, now),
+        )
 
     async def find_shop_item(self, item_name: str, group_id: str) -> dict[str, Any] | None:
         """查找道具：优先本群专属，其次全局。"""

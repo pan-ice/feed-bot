@@ -415,7 +415,7 @@ class AdminCommandsMixin:
     @Command(
         "admin_attr",
         description="设置Bot属性（管理员）",
-        pattern=r"^/投喂管理\s+属性\s+(?P<attr_key>\S+)\s+(?P<attr_value>\d+\.?\d*)$",
+        pattern=r"^/投喂管理\s+属性\s+(?P<attr_key>\S+)\s+(?P<attr_value>\d+\.?\d*)(?:\s+(?P<target_group>\S+))?$",
     )
     async def handle_admin_attr(
         self,
@@ -439,14 +439,20 @@ class AdminCommandsMixin:
 
         attr_key = str(matched_groups.get("attr_key") or "").strip()
         attr_value_str = str(matched_groups.get("attr_value") or "").strip()
+        target_group = str(matched_groups.get("target_group") or "").strip()
 
         if not attr_key or not attr_value_str:
-            await self.ctx.send.text("用法：/投喂管理 属性 satiety <值>", stream_id)
+            await self.ctx.send.text("用法：/投喂管理 属性 satiety <值> [群号]", stream_id)
             return False, "参数缺失", True
 
         if attr_key != "satiety":
             await self.ctx.send.text("无效属性名，当前仅支持：satiety", stream_id)
             return False, "无效属性名", True
+
+        effective_group = target_group or group_id
+        if not effective_group:
+            await self.ctx.send.text("需要指定群号：/投喂管理 属性 satiety <值> <群号>", stream_id)
+            return False, "缺少群号", True
 
         try:
             attr_value = float(attr_value_str)
@@ -454,10 +460,10 @@ class AdminCommandsMixin:
             await self.ctx.send.text("属性值必须是数字", stream_id)
             return False, "属性值格式错误", True
 
-        await self.db.set_satiety(attr_value, group_id)
+        await self.db.set_satiety(attr_value, effective_group)
 
         await self.ctx.send.text(
-            f"✅ 饱食度已设置为 {attr_value:.0f}", stream_id
+            f"✅ 群 {effective_group} 饱食度已设置为 {attr_value:.0f}", stream_id
         )
         return True, f"设置属性{attr_key}", True
 
