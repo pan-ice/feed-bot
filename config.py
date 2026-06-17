@@ -53,6 +53,28 @@ class BotAttrConfig(PluginConfigBase):
     )
 
 
+class GroupAdminEntry(PluginConfigBase):
+    """单个群的授权配置。"""
+
+    __ui_label__ = "群配置"
+    __ui_icon__ = "users"
+    __ui_order__ = 0
+
+    group_id: str = Field(default="", description="群号")
+    admin_users: str = Field(
+        default="",
+        description="管理员QQ号（多个用逗号、空格或 | 分隔）",
+    )
+
+    def gid(self) -> str:
+        """返回清理后的群号。"""
+        return str(self.group_id or "").strip()
+
+    def admin_list(self) -> list[str]:
+        """返回解析后的管理员QQ列表。"""
+        return [s.strip() for s in str(self.admin_users or "").replace(",", " ").replace("|", " ").split() if s.strip()]
+
+
 class FilterConfig(PluginConfigBase):
     """触发控制配置。"""
 
@@ -60,9 +82,9 @@ class FilterConfig(PluginConfigBase):
     __ui_icon__ = "filter"
     __ui_order__ = 4
 
-    group_admins: list[dict[str, str]] = Field(
+    group_admins: list[GroupAdminEntry] = Field(
         default_factory=list,
-        description="群管理员配置，每项包含 group_id（群号）和 admin_users（管理员QQ，空格/逗号/|分隔）",
+        description="授权群配置，每项包含群号和管理员QQ。只有在列表中的群才会响应命令",
     )
 
 

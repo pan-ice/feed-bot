@@ -37,10 +37,9 @@ class AdminCommandsMixin:
         """返回配置中授权的所有群号。"""
         result: set[str] = set()
         for item in self.config.filter.group_admins:
-            if isinstance(item, dict):
-                gid = str(item.get("group_id", "") or "").strip()
-                if gid:
-                    result.add(gid)
+            gid = item.gid()
+            if gid:
+                result.add(gid)
         return result
 
     def _is_group_enabled(self, group_id: str) -> bool:
@@ -62,27 +61,26 @@ class AdminCommandsMixin:
         WebUI 用户修改 config.toml 后通过 on_config_update 同步到数据库。
         命令用户通过 /投喂管理 群列表 查看运行时授权。
         """
+        from .config import GroupAdminEntry
         admins = self.config.filter.group_admins
         for item in admins:
-            if isinstance(item, dict) and str(item.get("group_id", "")) == target_group_id:
-                raw = str(item.get("admin_users", "") or "")
-                existing = AsyncDatabase._parse_admin_str(raw)
+            if item.gid() == target_group_id:
+                existing = item.admin_list()
                 if target_user not in existing:
                     existing.append(target_user)
-                    item["admin_users"] = AsyncDatabase._serialize_admin_list(existing)
+                    item.admin_users = AsyncDatabase._serialize_admin_list(existing)
                 return
-        admins.append({"group_id": target_group_id, "admin_users": target_user})
+        admins.append(GroupAdminEntry(group_id=target_group_id, admin_users=target_user))
 
     def _remove_group_admin_from_memory(self, target_group_id: str, target_user: str) -> None:
         """在内存配置中移除群管理员（不写文件）。"""
         admins = self.config.filter.group_admins
         for item in admins:
-            if isinstance(item, dict) and str(item.get("group_id", "")) == target_group_id:
-                raw = str(item.get("admin_users", "") or "")
-                existing = AsyncDatabase._parse_admin_str(raw)
+            if item.gid() == target_group_id:
+                existing = item.admin_list()
                 if target_user in existing:
                     existing.remove(target_user)
-                    item["admin_users"] = AsyncDatabase._serialize_admin_list(existing)
+                    item.admin_users = AsyncDatabase._serialize_admin_list(existing)
                 return
 
     # ---- 道具参数解析 ----

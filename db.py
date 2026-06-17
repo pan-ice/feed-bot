@@ -604,14 +604,11 @@ class AsyncDatabase:
         除非 config 中有值（WebUI 主动修改时覆盖同步）。
         """
         for item in config.filter.group_admins:
-            if not isinstance(item, dict):
-                continue
-            gid = str(item.get("group_id", "") or "").strip()
+            gid = item.gid()
             if not gid:
                 continue
 
-            raw = str(item.get("admin_users", "") or "")
-            config_admins = self._parse_admin_str(raw)
+            config_admins = item.admin_list()
 
             # 确保群记录存在
             row = await self.fetchone(
