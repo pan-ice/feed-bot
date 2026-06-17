@@ -3,7 +3,7 @@ enabled = true
 config_version = "1.0.0"
 
 [admin]
-admin_users = ["123123123"]
+admin_users = ["2669494215"]
 
 [sign]
 base_points = 10
@@ -15,11 +15,17 @@ initial_satiety = 80.0
 satiety_decay_rate = 15.0
 seek_feed_threshold = 30.0
 seek_feed_cooldown = 7200.0
+seek_feed_messages = [
+    "呜呜...好饿好饿..我真的好饿（测试——）？🥺",
+    "肚子咕咕叫了...能投喂我一些吃的吗？😢",
+    "有点想吃东西了...有人愿意投喂我吗？🥺",
+    "虽然还不算太饿，但如果有人投喂我就好了~",
+]
 
 [filter]
 [[filter.group_admins]]
-group_id = "123123123"
-admin_users = "123123123"
+group_id = "716028544"
+admin_users = "2669494215"
 
 [llm]
 enabled = true

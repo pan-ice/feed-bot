@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 import time
 from typing import Any
@@ -106,15 +107,9 @@ class LoopTasksMixin:
                             if time.time() - last_seek_time < cooldown:
                                 continue
 
-                            # 根据饱食度生成求喂消息（使用自定义消息）
-                            if satiety < 10:
-                                seek_msg = self.config.bot_attr.seek_feed_msg_low
-                            elif satiety < 20:
-                                seek_msg = self.config.bot_attr.seek_feed_msg_medium
-                            elif satiety < 30:
-                                seek_msg = self.config.bot_attr.seek_feed_msg_high
-                            else:
-                                seek_msg = self.config.bot_attr.seek_feed_msg_hint
+                            # 从自定义消息列表中随机选择一条
+                            messages = self.config.bot_attr.seek_feed_messages
+                            seek_msg = random.choice(messages) if messages else "好饿...有人投喂我吗？🥺"
 
                             # 如果开启了 LLM，尝试生成更自然的求喂消息
                             if self.config.llm.enabled:
