@@ -51,6 +51,22 @@ class BotAttrConfig(PluginConfigBase):
     seek_feed_cooldown: float = Field(
         default=7200.0, description="求投喂消息冷却时间（秒，默认2小时）"
     )
+    seek_feed_msg_low: str = Field(
+        default="呜呜...好饿好饿...有没有人投喂我呀？🥺",
+        description="饱食度很低（<10）时的求投喂消息",
+    )
+    seek_feed_msg_medium: str = Field(
+        default="肚子咕咕叫了...能投喂我一些吃的吗？😢",
+        description="饱食度较低（10-20）时的求投喂消息",
+    )
+    seek_feed_msg_high: str = Field(
+        default="有点想吃东西了...有人愿意投喂我吗？🥺",
+        description="饱食度偏低（20-30）时的求投喂消息",
+    )
+    seek_feed_msg_hint: str = Field(
+        default="虽然还不算太饿，但如果有人投喂我就好了~",
+        description="饱食度接近阈值（≥30）时的求投喂消息",
+    )
 
 
 class GroupAdminEntry(PluginConfigBase):

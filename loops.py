@@ -106,15 +106,15 @@ class LoopTasksMixin:
                             if time.time() - last_seek_time < cooldown:
                                 continue
 
-                            # 根据饱食度生成求喂消息
+                            # 根据饱食度生成求喂消息（使用自定义消息）
                             if satiety < 10:
-                                seek_msg = "呜呜...好饿好饿...有没有人投喂我呀？🥺"
+                                seek_msg = self.config.bot_attr.seek_feed_msg_low
                             elif satiety < 20:
-                                seek_msg = "肚子咕咕叫了...能投喂我一些吃的吗？😢"
+                                seek_msg = self.config.bot_attr.seek_feed_msg_medium
                             elif satiety < 30:
-                                seek_msg = "有点想吃东西了...有人愿意投喂我吗？🥺"
+                                seek_msg = self.config.bot_attr.seek_feed_msg_high
                             else:
-                                seek_msg = "虽然还不算太饿，但如果有人投喂我就好了~"
+                                seek_msg = self.config.bot_attr.seek_feed_msg_hint
 
                             # 如果开启了 LLM，尝试生成更自然的求喂消息
                             if self.config.llm.enabled:
