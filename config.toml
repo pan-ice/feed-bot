@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "1.0.0"
+config_version = "1.0.1"
 
 [admin]
 admin_users = ["2669494215"]
@@ -19,7 +19,6 @@ seek_feed_messages = [
     "呜呜...好饿好饿..我真的好饿（测试——）？🥺",
     "肚子咕咕叫了...能投喂我一些吃的吗？😢",
     "有点想吃东西了...有人愿意投喂我吗？🥺",
-    "虽然还不算太饿，但如果有人投喂我就好了~",
 ]
 
 [filter]
