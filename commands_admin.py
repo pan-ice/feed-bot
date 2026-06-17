@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import os
 import re
 import time
 from typing import Any
 
-import tomlkit
 from maibot_sdk import Command
 
 from .config import FeedBotConfig
 from .db import AsyncDatabase
-from .utils import PLUGIN_DIR, extract_nickname, is_likely_emoji
+from .utils import extract_nickname, is_likely_emoji
 
 
 class AdminCommandsMixin:
@@ -55,19 +53,15 @@ class AdminCommandsMixin:
             return False
         return True
 
-    # ---- 配置文件同步（用 tomlkit 读写，与 Host/WebUI 格式一致） ----
+    # ---- 内存配置同步（运行时授权不写 config.toml，参照 bilibili 插件模式） ----
 
-    def _sync_admin_to_config(self, target_group_id: str, target_user: str) -> None:
-        """在 config.toml 中添加群管理员（用 tomlkit 读写，保留格式）。"""
-        config_path = os.path.join(PLUGIN_DIR, "config.toml")
-        try:
-            doc = self._load_toml_doc(config_path)
-            self._update_toml_group_admins(doc, target_group_id, target_user, add=True)
-            self._save_toml_doc(config_path, doc)
-        except Exception as e:
-            self.ctx.logger.warning(f"同步配置文件失败: {e}")
+    def _add_group_admin_to_memory(self, target_group_id: str, target_user: str) -> None:
+        """在内存配置中添加群管理员（供 _enabled_group_ids 使用，不写文件）。
 
-        # 同时更新内存配置（供 _enabled_group_ids 使用）
+        运行时授权数据持久化到数据库，config.toml 仅作为初始配置源。
+        WebUI 用户修改 config.toml 后通过 on_config_update 同步到数据库。
+        命令用户通过 /投喂管理 群列表 查看运行时授权。
+        """
         admins = self.config.filter.group_admins
         for item in admins:
             if isinstance(item, dict) and str(item.get("group_id", "")) == target_group_id:
@@ -79,17 +73,8 @@ class AdminCommandsMixin:
                 return
         admins.append({"group_id": target_group_id, "admin_users": target_user})
 
-    def _sync_admin_removal_to_config(self, target_group_id: str, target_user: str) -> None:
-        """在 config.toml 中移除群管理员（用 tomlkit 读写，保留格式）。"""
-        config_path = os.path.join(PLUGIN_DIR, "config.toml")
-        try:
-            doc = self._load_toml_doc(config_path)
-            self._update_toml_group_admins(doc, target_group_id, target_user, add=False)
-            self._save_toml_doc(config_path, doc)
-        except Exception as e:
-            self.ctx.logger.warning(f"同步配置文件失败: {e}")
-
-        # 同时更新内存配置
+    def _remove_group_admin_from_memory(self, target_group_id: str, target_user: str) -> None:
+        """在内存配置中移除群管理员（不写文件）。"""
         admins = self.config.filter.group_admins
         for item in admins:
             if isinstance(item, dict) and str(item.get("group_id", "")) == target_group_id:
@@ -99,54 +84,6 @@ class AdminCommandsMixin:
                     existing.remove(target_user)
                     item["admin_users"] = AsyncDatabase._serialize_admin_list(existing)
                 return
-
-    @staticmethod
-    def _load_toml_doc(config_path: str) -> Any:
-        """用 tomlkit 加载 config.toml，保留格式和注释。"""
-        if not os.path.exists(config_path):
-            return tomlkit.document()
-        with open(config_path, "r", encoding="utf-8") as f:
-            return tomlkit.load(f)
-
-    @staticmethod
-    def _save_toml_doc(config_path: str, doc: Any) -> None:
-        """用 tomlkit 写回 config.toml，保留格式。"""
-        with open(config_path, "w", encoding="utf-8") as f:
-            tomlkit.dump(doc, f)
-
-    @staticmethod
-    def _update_toml_group_admins(doc: Any, target_group_id: str, target_user: str, *, add: bool) -> None:
-        """在 tomlkit 文档中添加或移除群管理员。"""
-        filter_section = doc.get("filter")
-        if filter_section is None:
-            filter_section = tomlkit.table(is_super_table=True)
-            doc["filter"] = filter_section
-
-        # 查找或创建对应的 [[filter.group_admins]] 条目
-        group_admins = filter_section.get("group_admins")
-        if group_admins is None:
-            group_admins = tomlkit.aot()
-            filter_section["group_admins"] = group_admins
-
-        for entry in group_admins:
-            if isinstance(entry, dict) and str(entry.get("group_id", "")) == target_group_id:
-                raw = str(entry.get("admin_users", "") or "")
-                existing = AsyncDatabase._parse_admin_str(raw)
-                if add:
-                    if target_user not in existing:
-                        existing.append(target_user)
-                else:
-                    if target_user in existing:
-                        existing.remove(target_user)
-                entry["admin_users"] = AsyncDatabase._serialize_admin_list(existing)
-                return
-
-        # 未找到该群条目，添加新的
-        if add:
-            new_entry = tomlkit.table()
-            new_entry["group_id"] = target_group_id
-            new_entry["admin_users"] = target_user
-            group_admins.append(new_entry)
 
     # ---- 道具参数解析 ----
 
@@ -540,8 +477,8 @@ class AdminCommandsMixin:
 
         # 写入数据库（运行时授权）
         await self.db.add_group_admin(target_group_id, target_user)
-        # 同步到 config.toml + 内存配置（WebUI 可见）
-        self._sync_admin_to_config(target_group_id, target_user)
+        # 同步更新内存配置（供 _enabled_group_ids 使用）
+        self._add_group_admin_to_memory(target_group_id, target_user)
 
         await self.ctx.send.text(
             f"✅ 已授权 {target_user} 为群 {target_group_id} 的管理员", stream_id
@@ -591,8 +528,8 @@ class AdminCommandsMixin:
 
         # 从数据库移除（运行时授权）
         await self.db.remove_group_admin(target_group_id, target_user)
-        # 同步到 config.toml + 内存配置
-        self._sync_admin_removal_to_config(target_group_id, target_user)
+        # 同步更新内存配置
+        self._remove_group_admin_from_memory(target_group_id, target_user)
 
         await self.ctx.send.text(
             f"✅ 已取消 {target_user} 在群 {target_group_id} 的管理员权限", stream_id
