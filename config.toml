@@ -3,7 +3,7 @@ enabled = true
 config_version = "1.0.1"
 
 [admin]
-admin_users = ["2669494215"]
+admin_users = ["123123123"]
 
 [sign]
 base_points = 10
@@ -23,8 +23,8 @@ seek_feed_messages = [
 
 [filter]
 [[filter.group_admins]]
-group_id = "716028544"
-admin_users = "2669494215"
+group_id = "123456"
+admin_users = "12314442"
 
 [llm]
 enabled = true
