@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "1.0.1"
+config_version = "1.0.2"
 
 [admin]
 admin_users = ["123123123"]
@@ -20,6 +20,7 @@ seek_feed_messages = [
     "肚子咕咕叫了...能投喂我一些吃的吗？😢",
     "有点想吃东西了...有人愿意投喂我吗？🥺",
 ]
+quiet_hours = "23:00-08:00"
 
 [filter]
 [[filter.group_admins]]

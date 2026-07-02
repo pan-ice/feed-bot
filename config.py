@@ -13,7 +13,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用投喂插件")
-    config_version: str = Field(default="1.0.1", description="配置版本")
+    config_version: str = Field(default="1.0.2", description="配置版本")
 
 
 class AdminConfig(PluginConfigBase):
@@ -50,6 +50,10 @@ class BotAttrConfig(PluginConfigBase):
     seek_feed_threshold: float = Field(default=30.0, description="饱食度低于此值触发求投喂")
     seek_feed_cooldown: float = Field(
         default=7200.0, description="求投喂消息冷却时间（秒，默认2小时）"
+    )
+    quiet_hours: str = Field(
+        default="23:00-08:00",
+        description="求投喂安静时段，格式 'HH:MM-HH:MM'（24小时制），该时段内不发送求投喂消息；留空则不限制",
     )
     seek_feed_messages: list[str] = Field(
         default_factory=lambda: [

@@ -6,6 +6,7 @@ import asyncio
 import random
 import re
 import time
+from datetime import datetime, time as dt_time
 from typing import Any
 
 from .config import FeedBotConfig
@@ -48,6 +49,36 @@ class LoopTasksMixin:
     db: AsyncDatabase
     config: FeedBotConfig
     _running: bool
+
+    # ---- 安静时段判断 ----
+
+    @staticmethod
+    def _in_quiet_hours(quiet_hours: str, now: datetime | None = None) -> bool:
+        """判断当前时间是否在安静时段内。
+
+        quiet_hours 格式 'HH:MM-HH:MM'（24小时制），留空返回 False。
+        支持跨午夜时段，如 '23:00-08:00'。
+        """
+        spec = (quiet_hours or "").strip()
+        if not spec:
+            return False
+
+        m = re.match(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$", spec)
+        if not m:
+            return False
+
+        sh, sm, eh, em = (int(g) for g in m.groups())
+        start = dt_time(sh, sm)
+        end = dt_time(eh, em)
+        current = (now or datetime.now()).time()
+
+        if start == end:
+            return False
+        if start < end:
+            # 同一天内，如 00:00-06:00
+            return start <= current < end
+        # 跨午夜，如 23:00-08:00
+        return current >= start or current < end
 
     # ---- 定时任务 ----
 
@@ -105,6 +136,10 @@ class LoopTasksMixin:
                             )
                             last_seek_time = row[0] if row else 0
                             if time.time() - last_seek_time < cooldown:
+                                continue
+
+                            # 安静时段内不发送求投喂消息（不打扰用户休息）
+                            if self._in_quiet_hours(self.config.bot_attr.quiet_hours):
                                 continue
 
                             # 从自定义消息列表中随机选择一条

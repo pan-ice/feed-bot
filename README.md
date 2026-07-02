@@ -65,7 +65,7 @@ MaiBot 投喂插件 — 签到积分 + 商店道具 + 投喂Bot + 定时求投�
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `enabled` | bool | `true` | 是否启用投喂插件 |
-| `config_version` | string | `"1.0.1"` | 配置版本号 |
+| `config_version` | string | `"1.0.2"` | 配置版本号 |
 
 ### `[admin]` 管理员
 
@@ -102,6 +102,7 @@ admin_users = ["123456789", "987654321"]
 | `satiety_decay_rate` | float | `0.5` | 饱食度每小时衰减量 |
 | `seek_feed_threshold` | float | `30.0` | 饱食度低于此值时触发求投喂 |
 | `seek_feed_cooldown` | float | `7200.0` | 求投喂消息冷却时间（秒，默认2小时） |
+| `quiet_hours` | string | `"23:00-08:00"` | 求投喂安静时段，格式 `HH:MM-HH:MM`（24小时制），该时段内不发送求投喂消息；留空则不限制 |
 | `seek_feed_messages` | list[str] | (5条默认消息) | 求投喂消息列表，随机选择一条发送（LLM开启时优先用LLM生成） |
 
 属性机制：
