@@ -259,6 +259,7 @@ class AsyncDatabase:
                 item_id INTEGER NOT NULL,
                 item_name TEXT NOT NULL,
                 item_emoji TEXT NOT NULL DEFAULT '',
+                quantity INTEGER NOT NULL DEFAULT 1,
                 reply_text TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL
             )
@@ -287,6 +288,15 @@ class AsyncDatabase:
             )
             """
         )
+
+        # 迁移：添加投喂数量列（批量投喂记录）
+        feed_record_columns = {
+            row[1] for row in self._db.execute("PRAGMA table_info(feed_records)").fetchall()
+        }
+        if "quantity" not in feed_record_columns:
+            self._db.execute(
+                "ALTER TABLE feed_records ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1"
+            )
 
         # 迁移：添加 last_decay_time 列（基于时间戳衰减）
         try:

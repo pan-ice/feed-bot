@@ -208,6 +208,7 @@ class LoopTasksMixin:
         user_nickname: str,
         item_name: str,
         item_emoji: str,
+        quantity: int,
         feed_reply_hint: str,
         satiety_before: float,
         satiety_after: float,
@@ -222,10 +223,12 @@ class LoopTasksMixin:
         recent_text = ""
         if recent_feeds:
             parts: list[str] = []
-            for feed_name, feed_emoji, feed_reply in recent_feeds:
+            for feed_name, feed_emoji, feed_quantity, feed_reply in recent_feeds:
                 display = f"{feed_emoji}{feed_name}" if feed_emoji else feed_name
                 short = feed_reply[:20] + "..." if feed_reply and len(feed_reply) > 20 else (feed_reply or "")
-                parts.append(f"{display}" + (f"({short})" if short else ""))
+                parts.append(
+                    f"{display} x{feed_quantity}" + (f"({short})" if short else "")
+                )
             recent_text = "、".join(parts)
 
         # 构造 prompt（用户可控字段做清洗防注入）
@@ -235,8 +238,8 @@ class LoopTasksMixin:
         safe_recent = _sanitize_prompt_input(recent_text, max_len=500)
 
         prompt_parts = [
-            f"你是一个可爱的聊天机器人，刚刚被{safe_nickname}投喂了{item_emoji}{safe_item_name}。",
-            f"投喂前饱食度{satiety_before:.0f}/100，投喂后{satiety_after:.0f}/100（增加了{satiety_bonus:.0f}）。",
+            f"你是一个可爱的聊天机器人，刚刚被{safe_nickname}投喂了{item_emoji}{safe_item_name} x{quantity}。",
+            f"投喂前饱食度{satiety_before:.0f}/100，投喂后{satiety_after:.0f}/100（变化了{satiety_bonus:+.0f}）。",
             "不要在回复中重复饱食度数值，只需自然地表达感受即可。",
         ]
         # 尝试获取 bot 人设和表达风格

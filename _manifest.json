@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.pan-ice.plugins-feed-bot",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "name": "投喂插件",
   "description": "签到积分+商店道具+投喂Bot+定时求投喂，支持群内商店、群管理员授权、按群隔离数据。",
   "author": {

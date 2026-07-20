@@ -2,15 +2,52 @@
 
 from __future__ import annotations
 
-import time
 from datetime import datetime, timedelta
 from typing import Any
+
+import math
+import re
+import time
 
 from maibot_sdk import Command
 
 from .config import FeedBotConfig
 from .db import AsyncDatabase, _Rollback
 from .utils import extract_nickname
+
+MAX_BATCH_QUANTITY = 100
+
+
+def parse_item_request(raw: str) -> tuple[str, int, str | None]:
+    """解析道具名和可选的 x数量 后缀。"""
+    value = raw.strip()
+    if not value:
+        return "", 0, "缺少道具名"
+
+    match = re.match(r"^(?P<item_name>.+?)(?:\s+[xX*×](?P<quantity>\S+))?$", value)
+    if match is None:
+        return "", 0, "参数格式错误"
+
+    item_name = match.group("item_name").strip()
+    quantity_text = match.group("quantity")
+    if quantity_text is None:
+        return item_name, 1, None
+    if not quantity_text.isdigit() or quantity_text == "0":
+        return item_name, 0, "数量必须是正整数"
+
+    normalized_quantity = quantity_text.lstrip("0") or "0"
+    if normalized_quantity == "0":
+        return item_name, 0, "数量必须是正整数"
+
+    max_quantity_text = str(MAX_BATCH_QUANTITY)
+    if len(normalized_quantity) > len(max_quantity_text) or (
+        len(normalized_quantity) == len(max_quantity_text)
+        and normalized_quantity > max_quantity_text
+    ):
+        return item_name, 0, f"单次最多操作{MAX_BATCH_QUANTITY}个道具"
+
+    quantity = int(normalized_quantity)
+    return item_name, quantity, None
 
 
 class UserCommandsMixin:
@@ -100,7 +137,7 @@ class UserCommandsMixin:
 
         base = self.config.sign.base_points
         lines = [
-            f"✅ 签到成功！",
+            "✅ 签到成功！",
             f"💰 获得积分：{earned}（基础{base} + 连续奖励{bonus}）",
             f"📅 连续签到：{consecutive_days}天  累计签到：{total_days}天",
         ]
@@ -263,7 +300,7 @@ class UserCommandsMixin:
         await self.ctx.send.text("\n".join(lines), stream_id)
         return True, "查看商店", True
 
-    @Command("buy_item", description="购买道具", pattern=r"^/购买\s+(?P<item_name>.+)$")
+    @Command("buy_item", description="购买道具", pattern=r"^/购买\s+(?P<item_request>.+)$")
     async def handle_buy(
         self,
         stream_id: str = "",
@@ -281,10 +318,13 @@ class UserCommandsMixin:
         matched_groups = kwargs.get("matched_groups")
         if not isinstance(matched_groups, dict):
             matched_groups = {}
-        item_name = str(matched_groups.get("item_name") or "").strip()
-        if not item_name:
-            await self.ctx.send.text("用法：/购买 <道具名>", stream_id)
-            return False, "缺少道具名", True
+        item_request = str(matched_groups.get("item_request") or "")
+        item_name, quantity, error = parse_item_request(item_request)
+        if error:
+            await self.ctx.send.text(
+                f"{error}。用法：/购买 <道具名> [x数量]", stream_id
+            )
+            return False, error, True
 
         nickname = extract_nickname(message)
         await self.db.ensure_user(user_id, nickname, group_id)
@@ -296,12 +336,14 @@ class UserCommandsMixin:
             await self.ctx.send.text(f"没有找到道具「{item_name}」", stream_id)
             return False, "道具不存在", True
 
+        total_price = item["price"] * quantity
+
         # 在事务中原子完成：扣积分 + 加背包
         def _buy_tx(cursor: Any) -> int:
             # 扣积分（WHERE points >= ? 防止并发导致积分变负）
             cursor.execute(
                 "UPDATE users SET points = points - ? WHERE user_id = ? AND points >= ?",
-                (item["price"], uid, item["price"]),
+                (total_price, uid, total_price),
             )
             if cursor.rowcount == 0:
                 return -1  # 积分不足
@@ -309,10 +351,10 @@ class UserCommandsMixin:
             cursor.execute(
                 """
                 INSERT INTO user_inventory (user_id, item_id, quantity)
-                VALUES (?, ?, 1)
-                ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + 1
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + excluded.quantity
                 """,
-                (uid, item["item_id"]),
+                (uid, item["item_id"], quantity),
             )
             # 查询扣除后的实际积分
             cursor.execute(
@@ -332,18 +374,19 @@ class UserCommandsMixin:
             )
             current_points = row[0] if row else 0
             await self.ctx.send.text(
-                f"积分不足！{item['emoji']}{item['name']}需要{item['price']}积分，你只有{current_points}积分",
+                f"积分不足！{item['emoji']}{item['name']} x{quantity}需要{total_price}积分，"
+                f"你只有{current_points}积分",
                 stream_id,
             )
             return False, "积分不足", True
 
         remaining = result
         await self.ctx.send.text(
-            f"🛒 购买成功！获得 {item['emoji']}{item['name']} x1\n"
-            f"💰 剩余积分：{remaining}",
+            f"🛒 购买成功！获得 {item['emoji']}{item['name']} x{quantity}\n"
+            f"💰 花费积分：{total_price}  剩余积分：{remaining}",
             stream_id,
         )
-        return True, f"购买{item_name}", True
+        return True, f"购买{item_name} x{quantity}", True
 
     # ---- 背包命令 ----
 
@@ -391,7 +434,7 @@ class UserCommandsMixin:
 
     # ---- 投喂命令 ----
 
-    @Command("feed_bot", description="投喂Bot", pattern=r"^/投喂\s+(?P<item_name>.+)$")
+    @Command("feed_bot", description="投喂Bot", pattern=r"^/投喂\s+(?P<item_request>.+)$")
     async def handle_feed(
         self,
         stream_id: str = "",
@@ -412,40 +455,55 @@ class UserCommandsMixin:
         matched_groups = kwargs.get("matched_groups")
         if not isinstance(matched_groups, dict):
             matched_groups = {}
-        item_name = str(matched_groups.get("item_name") or "").strip()
-        if not item_name:
-            await self.ctx.send.text("用法：/投喂 <道具名>", stream_id)
-            return False, "缺少道具名", True
+        item_request = str(matched_groups.get("item_request") or "")
+        item_name, requested_quantity, error = parse_item_request(item_request)
+        if error:
+            await self.ctx.send.text(
+                f"{error}。用法：/投喂 <道具名> [x数量]", stream_id
+            )
+            return False, error, True
 
         nickname = extract_nickname(message)
         await self.db.ensure_user(user_id, nickname, group_id)
 
         uid = self.db.user_key(user_id, group_id)
 
-        row = await self.db.fetchone(
-            """
-            SELECT inv.item_id, inv.quantity, si.name, si.emoji, si.feed_reply_hint,
-                   si.satiety_bonus
-            FROM user_inventory inv
-            JOIN shop_items si ON inv.item_id = si.item_id
-            WHERE inv.user_id = ? AND si.name = ? AND inv.quantity > 0
-            """,
-            (uid, item_name),
-        )
-
-        if not row:
-            await self.ctx.send.text(
-                f"你没有「{item_name}」哦～去 /商店 购买或检查 /背包", stream_id
-            )
-            return False, "背包无此道具", True
-
-        item_id, _qty, name, emoji, reply_hint, satiety_bonus = row
-
-        # 在事务中原子完成：扣背包 + 设饱食度(防溢出) + 更新投喂次数 + 插入记录
-        def _feed_tx(cursor: Any) -> tuple[float, float] | None:
+        # 在事务中原子完成：校验库存 + 扣背包 + 更新饱食度和投喂记录
+        def _feed_tx(
+            cursor: Any,
+        ) -> tuple[str, int, float, float, int, str, str, str, float] | None:
             now_ts = time.time()
 
-            # 1. 获取当前饱食度（含衰减补偿）
+            # 1. 在事务内读取库存和道具信息，避免并发投喂产生超扣
+            cursor.execute(
+                """
+                SELECT inv.item_id, inv.quantity, si.name, si.emoji,
+                       si.feed_reply_hint, si.satiety_bonus
+                FROM user_inventory inv
+                JOIN shop_items si ON inv.item_id = si.item_id
+                WHERE inv.user_id = ? AND si.name = ? AND inv.quantity > 0
+                """,
+                (uid, item_name),
+            )
+            item_row = cursor.fetchone()
+            if item_row is None:
+                return ("missing", 0, 0.0, 0.0, 0, "", "", "", 0.0)
+
+            item_id, inventory_quantity, name, emoji, reply_hint, satiety_bonus = item_row
+            if inventory_quantity < requested_quantity:
+                return (
+                    "insufficient",
+                    inventory_quantity,
+                    0.0,
+                    0.0,
+                    0,
+                    name,
+                    emoji,
+                    reply_hint,
+                    satiety_bonus,
+                )
+
+            # 2. 获取当前饱食度（含衰减补偿）
             cursor.execute(
                 "SELECT satiety, last_decay_time FROM feed_groups WHERE group_id = ?",
                 (group_id,),
@@ -453,28 +511,48 @@ class UserCommandsMixin:
             fg_row = cursor.fetchone()
             if fg_row:
                 current_satiety, last_decay_time = fg_row[0], fg_row[1]
+                if current_satiety < 0:
+                    current_satiety = self.config.bot_attr.initial_satiety
                 if last_decay_time > 0:
                     hours_elapsed = (now_ts - last_decay_time) / 3600.0
-                    current_satiety = max(0.0, current_satiety - hours_elapsed * self.config.bot_attr.satiety_decay_rate)
+                    current_satiety = max(
+                        0.0,
+                        current_satiety
+                        - hours_elapsed * self.config.bot_attr.satiety_decay_rate,
+                    )
             else:
                 current_satiety = self.config.bot_attr.initial_satiety
 
-            # 2. 饱食度已满则回滚事务（不扣道具、不写记录）
-            if current_satiety >= 100:
-                raise _Rollback()
+            # 3. 正饱食度道具只消耗当前还能吃下的数量
+            if satiety_bonus > 0:
+                if current_satiety >= 100:
+                    raise _Rollback()
+                capacity_quantity = math.ceil((100.0 - current_satiety) / satiety_bonus)
+                consumed_quantity = min(requested_quantity, capacity_quantity)
+            else:
+                consumed_quantity = requested_quantity
 
-            # 3. 扣背包
+            # 4. 条件扣减库存，失败则回滚整笔投喂
             cursor.execute(
-                "UPDATE user_inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_id = ?",
-                (uid, item_id),
+                """
+                UPDATE user_inventory
+                SET quantity = quantity - ?
+                WHERE user_id = ? AND item_id = ? AND quantity >= ?
+                """,
+                (consumed_quantity, uid, item_id, consumed_quantity),
             )
+            if cursor.rowcount != 1:
+                raise RuntimeError("投喂时库存发生变化，请重试")
             cursor.execute(
                 "DELETE FROM user_inventory WHERE user_id = ? AND item_id = ? AND quantity <= 0",
                 (uid, item_id),
             )
 
-            # 4. 设饱食度
-            new_satiety = min(100.0, current_satiety + satiety_bonus)
+            # 5. 更新饱食度和实际投喂件数
+            new_satiety = max(
+                0.0,
+                min(100.0, current_satiety + satiety_bonus * consumed_quantity),
+            )
             cursor.execute(
                 """
                 INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
@@ -483,24 +561,44 @@ class UserCommandsMixin:
                 """,
                 (group_id, new_satiety, now_ts, now_ts, new_satiety, now_ts),
             )
-
-            # 5. 更新投喂次数
             cursor.execute(
-                "UPDATE users SET total_feed_count = total_feed_count + 1 WHERE user_id = ?",
-                (uid,),
+                "UPDATE users SET total_feed_count = total_feed_count + ? WHERE user_id = ?",
+                (consumed_quantity, uid),
             )
 
-            # 6. 插入投喂记录
+            # 6. 每次批量投喂写一条汇总记录
             cursor.execute(
                 """
                 INSERT INTO feed_records (user_id, nickname, group_id, item_id,
-                                           item_name, item_emoji, reply_text, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                           item_name, item_emoji, quantity,
+                                           reply_text, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (uid, nickname, group_id, item_id, name, emoji, "", now_ts),
+                (
+                    uid,
+                    nickname,
+                    group_id,
+                    item_id,
+                    name,
+                    emoji,
+                    consumed_quantity,
+                    "",
+                    now_ts,
+                ),
             )
+            record_id = cursor.lastrowid
 
-            return (current_satiety, new_satiety)
+            return (
+                "success",
+                consumed_quantity,
+                current_satiety,
+                new_satiety,
+                record_id,
+                name,
+                emoji,
+                reply_hint,
+                satiety_bonus,
+            )
 
         result = await self.db.run_in_transaction(_feed_tx)
 
@@ -508,13 +606,26 @@ class UserCommandsMixin:
             await self.ctx.send.text("我已经吃饱了，吃不下啦～等饿一点再喂我吧！", stream_id)
             return False, "饱食度已满", True
 
-        current_satiety, new_satiety = result
+        status, value, current_satiety, new_satiety, record_id, name, emoji, reply_hint, satiety_bonus = result
+        if status == "missing":
+            await self.ctx.send.text(
+                f"你没有「{item_name}」哦～去 /商店 购买或检查 /背包", stream_id
+            )
+            return False, "背包无此道具", True
+        if status == "insufficient":
+            await self.ctx.send.text(
+                f"库存不足！你想投喂 {item_name} x{requested_quantity}，背包里只有 x{value}",
+                stream_id,
+            )
+            return False, "库存不足", True
+
+        consumed_quantity = value
         satiety_change = new_satiety - current_satiety
 
         # 生成回复（在事务外，不影响数据一致性）
         recent_feeds = await self.db.execute(
             """
-            SELECT item_name, item_emoji, reply_text
+            SELECT item_name, item_emoji, quantity, reply_text
             FROM feed_records
             WHERE user_id = ?
             ORDER BY created_at DESC LIMIT 3
@@ -526,32 +637,33 @@ class UserCommandsMixin:
             user_nickname=nickname or user_id,
             item_name=name,
             item_emoji=emoji,
+            quantity=consumed_quantity,
             feed_reply_hint=reply_hint,
             satiety_before=current_satiety,
             satiety_after=new_satiety,
-            satiety_bonus=satiety_bonus,
+            satiety_bonus=satiety_change,
             recent_feeds=recent_feeds,
         )
 
-        # 更新投喂记录的回复文本
+        # 按记录 ID 精确更新本次投喂回复
         await self.db.execute_commit(
-            """
-            UPDATE feed_records SET reply_text = ?
-            WHERE user_id = ? AND item_id = ? AND created_at = (
-                SELECT created_at FROM feed_records
-                WHERE user_id = ? AND item_id = ?
-                ORDER BY created_at DESC LIMIT 1
-            )
-            """,
-            (reply, uid, item_id, uid, item_id),
+            "UPDATE feed_records SET reply_text = ? WHERE id = ?",
+            (reply, record_id),
         )
 
         display_item = f"{emoji}{name}" if emoji else name
+        truncated = consumed_quantity < requested_quantity
+        quantity_note = (
+            f"（请求 x{requested_quantity}，吃下 x{consumed_quantity}）"
+            if truncated
+            else f"x{consumed_quantity}"
+        )
         await self.ctx.send.text(
-            f"{nickname} 投喂了 {display_item} 给我～饱食度 +{satiety_change:.0f}（{new_satiety:.0f}/100）\n{reply}",
+            f"{nickname or user_id} 投喂了 {display_item} {quantity_note} 给我～"
+            f"饱食度 {satiety_change:+.0f}（{new_satiety:.0f}/100）\n{reply}",
             stream_id,
         )
-        return True, f"投喂{name}", True
+        return True, f"投喂{name} x{consumed_quantity}", True
 
     @Command("feed_history", description="查看投喂记录", pattern=r"^/投喂记录$")
     async def handle_feed_history(
@@ -572,7 +684,7 @@ class UserCommandsMixin:
         uid = self.db.user_key(user_id, group_id)
         rows = await self.db.execute(
             """
-            SELECT item_name, item_emoji, reply_text, created_at
+            SELECT item_name, item_emoji, quantity, reply_text, created_at
             FROM feed_records
             WHERE user_id = ?
             ORDER BY created_at DESC LIMIT 10
@@ -585,10 +697,10 @@ class UserCommandsMixin:
             return True, "无投喂记录", True
 
         lines = ["📜 投喂记录"]
-        for item_name, item_emoji, reply, created_at in rows:
+        for item_name, item_emoji, quantity, reply, created_at in rows:
             display = f"{item_emoji}{item_name}" if item_emoji else item_name
             dt = datetime.fromtimestamp(created_at).strftime("%m-%d %H:%M")
-            lines.append(f"  [{dt}] {display}")
+            lines.append(f"  [{dt}] {display} x{quantity}")
             if reply:
                 short_reply = reply[:30] + "..." if len(reply) > 30 else reply
                 lines.append(f"    ↳ {short_reply}")
