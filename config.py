@@ -13,7 +13,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用投喂插件")
-    config_version: str = Field(default="1.1.0", description="配置版本")
+    config_version: str = Field(default="1.1.1", description="配置版本")
 
 
 class AdminConfig(PluginConfigBase):

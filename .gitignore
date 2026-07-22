@@ -15,4 +15,5 @@ Thumbs.db
 
 config_back
 
+# 本地运行配置（由 MaiBot 按 config.py 默认值自动生成）
 config.toml
