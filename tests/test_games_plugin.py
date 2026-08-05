@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import time
 from pathlib import Path
@@ -167,6 +168,22 @@ def test_riddle_parse_llm_result() -> None:
     assert answer == "月亮"
 
 
+def test_participation_command_pattern() -> None:
+    pattern = (
+        r"^/游戏\s+(?P<game>猜数字|猜谜语|猜大小|石头剪刀布)"
+        r"\s+参与积分[：:](?P<participate>\d+)"
+        r"\s+获得积分[：:](?P<reward>\d+)$"
+    )
+    m = re.match(pattern, "/游戏 猜数字 参与积分：5 获得积分：30")
+    assert m is not None
+    assert m.group("game") == "猜数字"
+    assert m.group("participate") == "5"
+    assert m.group("reward") == "30"
+    m = re.match(pattern, "/游戏 石头剪刀布 参与积分:10 获得积分:20")
+    assert m is not None
+    assert m.group("game") == "石头剪刀布"
+
+
 # ---- 命令测试 ----
 
 
@@ -295,6 +312,99 @@ async def test_admin_set_riddle_reward_and_switch(plugin: PluginHarness) -> None
     assert result == (True, "开关猜谜语", True)
     assert plugin.config.game.riddle_enabled is False
     assert await plugin.db.get_setting("game:riddle_enabled") == "0"
+
+
+@pytest.mark.asyncio
+async def test_admin_set_participation(plugin: PluginHarness) -> None:
+    result = await plugin.handle_game_admin_set_participation(
+        stream_id="s",
+        user_id="admin",
+        group_id="",
+        matched_groups={"game": "猜数字", "participate": "5", "reward": "30"},
+    )
+    assert result == (True, "设置猜数字参与5获得30", True)
+    assert plugin.config.game.guess_number_participate == 5
+    assert plugin.config.game.guess_number_reward == 30
+    assert await plugin.db.get_setting("game:guess_number_participate") == "5"
+    assert await plugin.db.get_setting("game:guess_number_reward") == "30"
+
+    # 新实例从数据库恢复
+    config2 = FeedBotConfig()
+    harness2 = PluginHarness(plugin.db, config2)
+    await harness2._apply_game_settings_overrides()
+    assert config2.game.guess_number_participate == 5
+    assert config2.game.guess_number_reward == 30
+
+
+@pytest.mark.asyncio
+async def test_guess_number_participate_fee_and_reward(plugin: PluginHarness) -> None:
+    await _seed_user(plugin, points=100)
+    await plugin.handle_game_admin_set_participation(
+        stream_id="s",
+        user_id="admin",
+        group_id="",
+        matched_groups={"game": "猜数字", "participate": "5", "reward": "30"},
+    )
+    result = await plugin.handle_game_guess_number(
+        stream_id="s", user_id="user", group_id="group"
+    )
+    assert result == (True, "开始猜数字", True)
+    assert await plugin.db.get_points("group:user") == 95
+
+    plugin._game_sessions["group:user"] = {
+        "number": 42,
+        "tries_left": 7,
+        "started_at": time.time(),
+    }
+    result = await plugin.handle_game_guess_number(
+        stream_id="s",
+        user_id="user",
+        group_id="group",
+        matched_groups={"num": "42"},
+    )
+    assert result == (True, "猜中", True)
+    assert await plugin.db.get_points("group:user") == 125
+
+
+@pytest.mark.asyncio
+async def test_guess_number_participate_insufficient(plugin: PluginHarness) -> None:
+    await _seed_user(plugin, points=3)
+    await plugin.handle_game_admin_set_participation(
+        stream_id="s",
+        user_id="admin",
+        group_id="",
+        matched_groups={"game": "猜数字", "participate": "5", "reward": "30"},
+    )
+    result = await plugin.handle_game_guess_number(
+        stream_id="s", user_id="user", group_id="group"
+    )
+    assert result == (False, "参与积分不足", True)
+    assert await plugin.db.get_points("group:user") == 3
+    assert "group:user" not in plugin._game_sessions
+
+
+@pytest.mark.asyncio
+async def test_dice_fixed_participate_and_reward(plugin: PluginHarness) -> None:
+    await _seed_user(plugin, points=1000)
+    await plugin.handle_game_admin_set_participation(
+        stream_id="s",
+        user_id="admin",
+        group_id="",
+        matched_groups={"game": "猜大小", "participate": "50", "reward": "100"},
+    )
+    result = await plugin.handle_game_dice(
+        stream_id="s",
+        user_id="user",
+        group_id="group",
+        matched_groups={"choice": "大", "bet": "999"},
+    )
+    assert result == (True, "猜大小大", True)
+    points = await plugin.db.get_points("group:user")
+    assert points in (1100, 950), points
+    row = await plugin.db.fetchone(
+        "SELECT bet FROM game_records WHERE user_id = 'group:user' AND game = 'dice'"
+    )
+    assert row == (50,)
 
 
 @pytest.mark.asyncio

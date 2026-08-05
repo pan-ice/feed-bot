@@ -13,7 +13,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用投喂插件")
-    config_version: str = Field(default="2.2.0", description="配置版本")
+    config_version: str = Field(default="2.3.0", description="配置版本")
 
 
 class AdminConfig(PluginConfigBase):
@@ -135,6 +135,11 @@ class GameConfig(PluginConfigBase):
         description="猜数字奖励积分",
         json_schema_extra={"label": "猜数字奖励积分（guess_number_reward）"},
     )
+    guess_number_participate: int = Field(
+        default=0,
+        description="猜数字参与积分（0为免费）",
+        json_schema_extra={"label": "猜数字参与积分（guess_number_participate）"},
+    )
     guess_number_max_tries: int = Field(
         default=7,
         description="猜数字每局最大次数",
@@ -155,10 +160,30 @@ class GameConfig(PluginConfigBase):
         description="猜大小赔率（含本金）",
         json_schema_extra={"label": "猜大小赔率（dice_win_multiplier）"},
     )
+    dice_participate: int = Field(
+        default=0,
+        description="猜大小参与积分（0则按用户下注）",
+        json_schema_extra={"label": "猜大小参与积分（dice_participate）"},
+    )
+    dice_reward: int = Field(
+        default=0,
+        description="猜大小获得积分（0则按赔率结算）",
+        json_schema_extra={"label": "猜大小获得积分（dice_reward）"},
+    )
     rps_win_multiplier: float = Field(
         default=2.0,
         description="石头剪刀布赔率（含本金）",
         json_schema_extra={"label": "石头剪刀布赔率（rps_win_multiplier）"},
+    )
+    rps_participate: int = Field(
+        default=0,
+        description="石头剪刀布参与积分（0则按用户下注）",
+        json_schema_extra={"label": "石头剪刀布参与积分（rps_participate）"},
+    )
+    rps_reward: int = Field(
+        default=0,
+        description="石头剪刀布获得积分（0则按赔率结算）",
+        json_schema_extra={"label": "石头剪刀布获得积分（rps_reward）"},
     )
     guess_number_enabled: bool = Field(
         default=True,
@@ -169,6 +194,11 @@ class GameConfig(PluginConfigBase):
         default=200,
         description="猜谜语奖励积分",
         json_schema_extra={"label": "猜谜语奖励积分（riddle_reward）"},
+    )
+    riddle_participate: int = Field(
+        default=0,
+        description="猜谜语参与积分（0为免费）",
+        json_schema_extra={"label": "猜谜语参与积分（riddle_participate）"},
     )
     riddle_max_tries: int = Field(
         default=5,

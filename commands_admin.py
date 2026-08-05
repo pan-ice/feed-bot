@@ -736,9 +736,15 @@ class AdminCommandsMixin:
         mapping: dict[str, tuple[str, Any]] = {
             "game:daily_earn_limit": ("daily_earn_limit", int),
             "game:guess_number_reward": ("guess_number_reward", int),
+            "game:guess_number_participate": ("guess_number_participate", int),
             "game:riddle_reward": ("riddle_reward", int),
+            "game:riddle_participate": ("riddle_participate", int),
             "game:min_bet": ("min_bet", int),
             "game:max_bet": ("max_bet", int),
+            "game:dice_participate": ("dice_participate", int),
+            "game:dice_reward": ("dice_reward", int),
+            "game:rps_participate": ("rps_participate", int),
+            "game:rps_reward": ("rps_reward", int),
             "game:guess_number_enabled": ("guess_number_enabled", lambda v: v == "1"),
             "game:riddle_enabled": ("riddle_enabled", lambda v: v == "1"),
             "game:dice_enabled": ("dice_enabled", lambda v: v == "1"),
@@ -881,6 +887,90 @@ class AdminCommandsMixin:
             display="猜谜语奖励",
             validate=lambda v: None if v >= 1 else "数值必须大于等于 1",
         )
+
+    @Command(
+        "game_admin_set_participation",
+        description="设置游戏参与积分与获得积分（管理员）",
+        pattern=(
+            r"^/游戏\s+(?P<game>猜数字|猜谜语|猜大小|石头剪刀布)"
+            r"\s+参与积分[：:](?P<participate>\d+)"
+            r"\s+获得积分[：:](?P<reward>\d+)$"
+        ),
+    )
+    async def handle_game_admin_set_participation(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏 <游戏名> 参与积分：X 获得积分：Y 命令。"""
+        if not await self._check_game_admin(stream_id, group_id, user_id):
+            return False, "非管理员", True
+
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+        game = str(matched_groups.get("game") or "")
+        participate_text = str(matched_groups.get("participate") or "")
+        reward_text = str(matched_groups.get("reward") or "")
+
+        if not participate_text or not reward_text:
+            await self.ctx.send.text(
+                "用法：/游戏 <游戏名> 参与积分：<数值> 获得积分：<数值>",
+                stream_id,
+            )
+            return False, "参数缺失", True
+
+        try:
+            participate = int(participate_text)
+            reward = int(reward_text)
+        except ValueError:
+            await self.ctx.send.text("积分必须是整数", stream_id)
+            return False, "数值格式错误", True
+
+        if participate < 0 or reward < 0:
+            await self.ctx.send.text("积分不能为负数", stream_id)
+            return False, "数值超范围", True
+
+        attr_map = {
+            "猜数字": (
+                "guess_number_participate",
+                "game:guess_number_participate",
+                "guess_number_reward",
+                "game:guess_number_reward",
+            ),
+            "猜谜语": (
+                "riddle_participate",
+                "game:riddle_participate",
+                "riddle_reward",
+                "game:riddle_reward",
+            ),
+            "猜大小": (
+                "dice_participate",
+                "game:dice_participate",
+                "dice_reward",
+                "game:dice_reward",
+            ),
+            "石头剪刀布": (
+                "rps_participate",
+                "game:rps_participate",
+                "rps_reward",
+                "game:rps_reward",
+            ),
+        }
+        participate_attr, participate_key, reward_attr, reward_key = attr_map[game]
+        setattr(self.config.game, participate_attr, participate)
+        setattr(self.config.game, reward_attr, reward)
+        await self.db.set_setting(participate_key, str(participate))
+        await self.db.set_setting(reward_key, str(reward))
+
+        await self.ctx.send.text(
+            f"✅ {game} 参与积分已设置为 {participate}，"
+            f"获得积分已设置为 {reward}",
+            stream_id,
+        )
+        return True, f"设置{game}参与{participate}获得{reward}", True
 
     @Command(
         "game_admin_max_bet",

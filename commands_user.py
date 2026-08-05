@@ -982,6 +982,15 @@ class UserCommandsMixin:
             session = None
 
         if not num_text:
+            guard = await self._pay_participate(
+                stream_id,
+                user_id,
+                group_id,
+                "guess_number",
+                self.config.game.guess_number_participate,
+            )
+            if guard is not None:
+                return guard
             self._game_sessions[key] = guess_number.new_game(
                 self.config.game.guess_number_max_tries
             )
@@ -999,6 +1008,15 @@ class UserCommandsMixin:
             return False, "数字超范围", True
 
         if session is None:
+            guard = await self._pay_participate(
+                stream_id,
+                user_id,
+                group_id,
+                "guess_number",
+                self.config.game.guess_number_participate,
+            )
+            if guard is not None:
+                return guard
             session = guess_number.new_game(
                 self.config.game.guess_number_max_tries
             )
@@ -1073,6 +1091,15 @@ class UserCommandsMixin:
             session = None
 
         if session is None:
+            guard = await self._pay_participate(
+                stream_id,
+                user_id,
+                group_id,
+                "riddle",
+                self.config.game.riddle_participate,
+            )
+            if guard is not None:
+                return guard
             riddle_text, answer = await self._generate_riddle()
             session = riddle.new_session(
                 riddle_text, answer, self.config.game.riddle_max_tries
@@ -1171,7 +1198,11 @@ class UserCommandsMixin:
         if not isinstance(matched_groups, dict):
             matched_groups = {}
         choice = str(matched_groups.get("choice") or "").strip()
-        bet = int(str(matched_groups.get("bet") or "0"))
+        participate = self.config.game.dice_participate
+        if participate > 0:
+            bet = participate
+        else:
+            bet = int(str(matched_groups.get("bet") or "0"))
 
         await self.db.ensure_user(user_id, "", group_id)
         uid = self.db.user_key(user_id, group_id)
@@ -1181,7 +1212,11 @@ class UserCommandsMixin:
 
         value = dice.roll()
         win = dice.resolve(choice, value)
-        change = dice.net_change(bet, win, self.config.game.dice_win_multiplier)
+        fixed_reward = self.config.game.dice_reward
+        if participate > 0 and fixed_reward > 0:
+            change = fixed_reward if win else -bet
+        else:
+            change = dice.net_change(bet, win, self.config.game.dice_win_multiplier)
         new_points = await self.db.settle(
             uid, group_id, "dice", bet, 1 if win else 0, change
         )
@@ -1189,7 +1224,7 @@ class UserCommandsMixin:
         if win:
             await self.ctx.send.text(
                 f"🎲 骰子 {value}（{size_label}），你猜{choice}，中了！"
-                f"净赚 +{change}，当前 {new_points}",
+                f"积分 +{change}，当前 {new_points}",
                 stream_id,
             )
         else:
@@ -1230,7 +1265,11 @@ class UserCommandsMixin:
         if not isinstance(matched_groups, dict):
             matched_groups = {}
         choice = str(matched_groups.get("choice") or "").strip()
-        bet = int(str(matched_groups.get("bet") or "0"))
+        participate = self.config.game.rps_participate
+        if participate > 0:
+            bet = participate
+        else:
+            bet = int(str(matched_groups.get("bet") or "0"))
 
         await self.db.ensure_user(user_id, "", group_id)
         uid = self.db.user_key(user_id, group_id)
@@ -1240,7 +1279,11 @@ class UserCommandsMixin:
 
         bot = rps.bot_choice()
         result = rps.resolve(choice, bot)
-        change = rps.net_change(bet, result, self.config.game.rps_win_multiplier)
+        fixed_reward = self.config.game.rps_reward
+        if participate > 0 and fixed_reward > 0:
+            change = fixed_reward if result == "win" else (-bet if result == "lose" else 0)
+        else:
+            change = rps.net_change(bet, result, self.config.game.rps_win_multiplier)
         win = 1 if result == "win" else 0
         new_points = await self.db.settle(uid, group_id, "rps", bet, win, change)
         if result == "win":
@@ -1333,4 +1376,27 @@ class UserCommandsMixin:
                 f"积分不足！需要 {bet} 积分，你只有 {points}", stream_id
             )
             return False, "积分不足", True
+        return None
+
+    async def _pay_participate(
+        self,
+        stream_id: str,
+        user_id: str,
+        group_id: str,
+        game: str,
+        participate: int,
+    ) -> tuple[bool, str, bool] | None:
+        """扣除游戏参与积分，参与积分为 0 或余额不足时返回相应结果。"""
+        if participate <= 0:
+            return None
+        await self.db.ensure_user(user_id, "", group_id)
+        uid = self.db.user_key(user_id, group_id)
+        points = await self.db.get_points(uid)
+        if points < participate:
+            await self.ctx.send.text(
+                f"参与积分不足！需要 {participate} 积分，你只有 {points}",
+                stream_id,
+            )
+            return False, "参与积分不足", True
+        await self.db.settle(uid, group_id, game, participate, 0, -participate)
         return None

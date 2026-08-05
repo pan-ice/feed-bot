@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "worldcopyist.meow-game-shop",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "name": "Meow Game Shop",
   "description": "游戏商店喵喵喵（Meow Game Shop）— 签到积分+商店道具+投喂Bot+定时求投喂+小游戏，积分互通。",
   "author": {
