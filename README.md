@@ -158,12 +158,12 @@ admin_users = ["123456789", "987654321"]
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `initial_satiety` | float | `80.0` | 初始饱食度（0-100） |
-| `satiety_decay_rate` | float | `0.5` | 饱食度每小时衰减量 |
-| `seek_feed_threshold` | float | `30.0` | 饱食度低于此值触发求投喂 |
-| `seek_feed_cooldown` | float | `7200.0` | 求投喂消息冷却时间（秒，默认2小时） |
-| `quiet_hours` | string | `"23:00-08:00"` | 求投喂安静时段，格式 `HH:MM-HH:MM`（24小时制），该时段内不发送求投喂消息；留空则不限制 |
-| `seek_feed_messages` | list[str] | (5条默认消息) | 求投喂消息列表，随机选择一条发送（LLM开启时优先用LLM生成） |
+| 初始饱食度（`initial_satiety`） | float | `80.0` | 初始饱食度（0-100） |
+| 饱食度衰减量（`satiety_decay_rate`） | float | `0.5` | 饱食度每小时衰减量 |
+| 求投喂阈值（`seek_feed_threshold`） | float | `30.0` | 饱食度低于此值触发求投喂 |
+| 求投喂冷却时间（`seek_feed_cooldown`） | float | `7200.0` | 求投喂消息冷却时间（秒，默认2小时） |
+| 安静时段（`quiet_hours`） | string | `"23:00-08:00"` | 求投喂安静时段，格式 `HH:MM-HH:MM`（24小时制），该时段内不发送求投喂消息；留空则不限制 |
+| 求投喂消息（`seek_feed_messages`） | list[str] | (5条默认消息) | 求投喂消息列表，随机选择一条发送（LLM开启时优先用LLM生成） |
 
 属性机制：
 

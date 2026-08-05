@@ -41,19 +41,34 @@ class SignConfig(PluginConfigBase):
 class BotAttrConfig(PluginConfigBase):
     """Bot属性配置。"""
 
-    __ui_label__ = "Bot属性"
+    __ui_label__ = "Bot属性（bot_attr）"
     __ui_icon__ = "heart"
     __ui_order__ = 3
 
-    initial_satiety: float = Field(default=80.0, description="初始饱食度（0-100）")
-    satiety_decay_rate: float = Field(default=0.5, description="饱食度每小时衰减量")
-    seek_feed_threshold: float = Field(default=30.0, description="饱食度低于此值触发求投喂")
+    initial_satiety: float = Field(
+        default=80.0,
+        description="初始饱食度（0-100）",
+        json_schema_extra={"label": "初始饱食度（initial_satiety）"},
+    )
+    satiety_decay_rate: float = Field(
+        default=0.5,
+        description="饱食度每小时衰减量",
+        json_schema_extra={"label": "饱食度衰减量（satiety_decay_rate）"},
+    )
+    seek_feed_threshold: float = Field(
+        default=30.0,
+        description="饱食度低于此值触发求投喂",
+        json_schema_extra={"label": "求投喂阈值（seek_feed_threshold）"},
+    )
     seek_feed_cooldown: float = Field(
-        default=7200.0, description="求投喂消息冷却时间（秒，默认2小时）"
+        default=7200.0,
+        description="求投喂消息冷却时间（秒，默认2小时）",
+        json_schema_extra={"label": "求投喂冷却时间（seek_feed_cooldown）"},
     )
     quiet_hours: str = Field(
         default="23:00-08:00",
         description="求投喂安静时段，格式 'HH:MM-HH:MM'（24小时制），该时段内不发送求投喂消息；留空则不限制",
+        json_schema_extra={"label": "安静时段（quiet_hours）"},
     )
     seek_feed_messages: list[str] = Field(
         default_factory=lambda: [
@@ -64,6 +79,7 @@ class BotAttrConfig(PluginConfigBase):
             "好想吃东西呀...谁来投喂我一下嘛~",
         ],
         description="求投喂消息列表，随机选择一条发送（LLM开启时优先用LLM生成）",
+        json_schema_extra={"label": "求投喂消息（seek_feed_messages）"},
     )
 
 
