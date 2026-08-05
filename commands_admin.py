@@ -389,60 +389,6 @@ class AdminCommandsMixin:
         return True, f"设置属性{attr_key}", True
 
     @Command(
-        "admin_set_satiety",
-        description="设置群饱食度（管理员）",
-        pattern=r"^/投喂管理\s+饱食度\s+(?P<value>\d+\.?\d*)(?:\s+(?P<target_group>\S+))?$",
-    )
-    async def handle_admin_set_satiety(
-        self,
-        stream_id: str = "",
-        user_id: str = "",
-        group_id: str = "",
-        **kwargs: Any,
-    ) -> tuple[bool, str, bool]:
-        """处理 /投喂管理 饱食度 命令，设置群饱食度（1-100）。"""
-        if group_id:
-            if not await self._is_group_admin(group_id, user_id):
-                await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
-                return False, "非管理员", True
-        elif not self._is_bot_admin(user_id):
-            await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
-            return False, "非管理员", True
-
-        matched_groups = kwargs.get("matched_groups")
-        if not isinstance(matched_groups, dict):
-            matched_groups = {}
-
-        value_str = str(matched_groups.get("value") or "").strip()
-        target_group = str(matched_groups.get("target_group") or "").strip()
-
-        if not value_str:
-            await self.ctx.send.text("用法：/投喂管理 饱食度 <数值> [群号]", stream_id)
-            return False, "参数缺失", True
-
-        try:
-            value = float(value_str)
-        except ValueError:
-            await self.ctx.send.text("饱食度必须是数字", stream_id)
-            return False, "数值格式错误", True
-
-        if value < 1 or value > 100:
-            await self.ctx.send.text("饱食度必须在 1-100 之间", stream_id)
-            return False, "数值超出范围", True
-
-        effective_group = target_group or group_id
-        if not effective_group:
-            await self.ctx.send.text("需要指定群号：/投喂管理 饱食度 <数值> <群号>", stream_id)
-            return False, "缺少群号", True
-
-        await self.db.set_satiety(value, effective_group)
-
-        await self.ctx.send.text(
-            f"✅ 群 {effective_group} 饱食度已设置为 {value:.0f}", stream_id
-        )
-        return True, f"设置饱食度{value:.0f}", True
-
-    @Command(
         "admin_reset_sign",
         description="重置用户签到（管理员）",
         pattern=r"^/投喂管理\s+重置签到\s+(?P<target_user>\S+)(?:\s+(?P<target_group>\S+))?$",
