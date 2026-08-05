@@ -517,6 +517,16 @@ class AsyncDatabase:
             return initial
 
         satiety, last_decay_time = row[0], row[1]
+        # 记录存在但饱食度未初始化（如仅配置了群管理员时写入的 -1），
+        # 回退为初始饱食度并写回，避免 /饱食度 显示异常值
+        if satiety < 0:
+            initial = config.bot_attr.initial_satiety
+            now = time.time()
+            await self.execute_commit(
+                "UPDATE feed_groups SET satiety = ?, last_decay_time = ? WHERE group_id = ?",
+                (initial, now, group_id),
+            )
+            return initial
         # 补偿衰减（仅计算，不写回——写回由衰减循环统一负责）
         if last_decay_time > 0:
             hours_elapsed = (time.time() - last_decay_time) / 3600.0
