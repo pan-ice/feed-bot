@@ -296,6 +296,33 @@ class AsyncDatabase:
             )
             """
         )
+        # 迁移：新增小游戏记录表（小游戏插件共用同一数据库）
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                group_id TEXT NOT NULL DEFAULT '',
+                game TEXT NOT NULL,
+                bet INTEGER NOT NULL DEFAULT 0,
+                win INTEGER NOT NULL DEFAULT 0,
+                points_change INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        self._db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_game_records_user
+            ON game_records(user_id)
+            """
+        )
+        self._db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_game_records_group_time
+            ON game_records(group_id, created_at)
+            """
+        )
 
         # 迁移：添加投喂数量列（批量投喂记录）
         feed_record_columns = {
