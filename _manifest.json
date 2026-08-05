@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
-  "id": "worldcopyist.feed-entertainment",
-  "version": "2.0.0",
-  "name": "投喂娱乐插件",
-  "description": "签到积分+商店道具+投喂Bot+定时求投喂+小游戏，积分互通，支持群内商店、群管理员授权、按群隔离数据。",
+  "id": "worldcopyist.meow-game-shop",
+  "version": "2.1.0",
+  "name": "Meow Game Shop",
+  "description": "游戏商店喵喵喵（Meow Game Shop）— 签到积分+商店道具+投喂Bot+定时求投喂+小游戏，积分互通。",
   "author": {
     "name": "worldcopyist",
     "url": "https://github.com/worldcopyist"

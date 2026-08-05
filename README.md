@@ -1,8 +1,8 @@
-# 🍞 投喂娱乐插件 (feed-bot)
+# 🍞 游戏商店喵喵喵 (Meow Game Shop)
 
-MaiBot 投喂娱乐插件 — 签到积分 + 商店道具 + 投喂Bot + 定时求投喂 + 小游戏。
+MaiBot 游戏商店喵喵喵（Meow Game Shop）— 签到积分 + 商店道具 + 投喂Bot + 定时求投喂 + 小游戏。
 
-插件ID：`worldcopyist.feed-entertainment` ｜ 版本：`2.0.0`
+插件ID：`worldcopyist.meow-game-shop` ｜ 版本：`2.1.0`
 
 支持全局/群内两层商店、群管理员授权、按群隔离数据，以及自定义商品饱食度和签到积分。
 游戏积分与商店积分共用余额，可下注游玩并参与每日排行。
@@ -186,7 +186,7 @@ MaiBot 投喂娱乐插件 — 签到积分 + 商店道具 + 投喂Bot + 定时�
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `enabled` | bool | `true` | 是否启用投喂娱乐插件 |
-| `config_version` | string | `"2.0.0"` | 配置版本号 |
+| `config_version` | string | `"2.1.0"` | 配置版本号 |
 
 ### `[admin]` 管理员
 
@@ -336,7 +336,7 @@ pytest -q --rootdir=.. --import-mode=importlib tests
   - 新增 `/投喂规则`，可查看非管理员可使用的全部指令
   - 新增 `/投喂管理 签到积分 <数值>`，可实时设置签到基础积分并持久化
   - 整合小游戏：猜数字、骰子猜大小、石头剪刀布，积分与商店互通
-  - 插件更名为投喂娱乐插件（feed-entertainment）
+  - 插件更名为游戏商店喵喵喵（Meow Game Shop）
 
 ## 许可证
 
