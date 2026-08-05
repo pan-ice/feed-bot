@@ -13,7 +13,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用投喂插件")
-    config_version: str = Field(default="2.1.0", description="配置版本")
+    config_version: str = Field(default="2.2.0", description="配置版本")
 
 
 class AdminConfig(PluginConfigBase):
@@ -164,6 +164,21 @@ class GameConfig(PluginConfigBase):
         default=True,
         description="猜数字开关",
         json_schema_extra={"label": "猜数字开关（guess_number_enabled）"},
+    )
+    riddle_reward: int = Field(
+        default=200,
+        description="猜谜语奖励积分",
+        json_schema_extra={"label": "猜谜语奖励积分（riddle_reward）"},
+    )
+    riddle_max_tries: int = Field(
+        default=5,
+        description="猜谜语每局最大次数",
+        json_schema_extra={"label": "猜谜语最大次数（riddle_max_tries）"},
+    )
+    riddle_enabled: bool = Field(
+        default=True,
+        description="猜谜语开关",
+        json_schema_extra={"label": "猜谜语开关（riddle_enabled）"},
     )
     dice_enabled: bool = Field(
         default=True,

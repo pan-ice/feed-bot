@@ -736,9 +736,11 @@ class AdminCommandsMixin:
         mapping: dict[str, tuple[str, Any]] = {
             "game:daily_earn_limit": ("daily_earn_limit", int),
             "game:guess_number_reward": ("guess_number_reward", int),
+            "game:riddle_reward": ("riddle_reward", int),
             "game:min_bet": ("min_bet", int),
             "game:max_bet": ("max_bet", int),
             "game:guess_number_enabled": ("guess_number_enabled", lambda v: v == "1"),
+            "game:riddle_enabled": ("riddle_enabled", lambda v: v == "1"),
             "game:dice_enabled": ("dice_enabled", lambda v: v == "1"),
             "game:rps_enabled": ("rps_enabled", lambda v: v == "1"),
         }
@@ -853,6 +855,34 @@ class AdminCommandsMixin:
         )
 
     @Command(
+        "game_admin_riddle_reward",
+        description="设置猜谜语奖励（管理员）",
+        pattern=r"^/游戏管理\s+猜谜语\s+奖励\s+(?P<value>\d+)$",
+    )
+    async def handle_game_admin_riddle_reward(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏管理 猜谜语 奖励 命令。"""
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+        return await self._set_game_param(
+            stream_id,
+            user_id,
+            group_id,
+            matched_groups,
+            key="game:riddle_reward",
+            attr="riddle_reward",
+            value_text=str(matched_groups.get("value") or ""),
+            display="猜谜语奖励",
+            validate=lambda v: None if v >= 1 else "数值必须大于等于 1",
+        )
+
+    @Command(
         "game_admin_max_bet",
         description="设置下注上限（管理员）",
         pattern=r"^/游戏管理\s+下注上限\s+(?P<value>\d+)$",
@@ -919,7 +949,7 @@ class AdminCommandsMixin:
     @Command(
         "game_admin_switch",
         description="启停游戏（管理员）",
-        pattern=r"^/游戏管理\s+开关\s+(?P<game>猜数字|猜大小|石头剪刀布)\s+(?P<state>开|关)$",
+        pattern=r"^/游戏管理\s+开关\s+(?P<game>猜数字|猜谜语|猜大小|石头剪刀布)\s+(?P<state>开|关)$",
     )
     async def handle_game_admin_switch(
         self,
@@ -941,6 +971,7 @@ class AdminCommandsMixin:
 
         attr_map = {
             "猜数字": ("guess_number_enabled", "game:guess_number_enabled"),
+            "猜谜语": ("riddle_enabled", "game:riddle_enabled"),
             "猜大小": ("dice_enabled", "game:dice_enabled"),
             "石头剪刀布": ("rps_enabled", "game:rps_enabled"),
         }

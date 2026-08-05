@@ -42,6 +42,7 @@ AdminCommandsMixin = commands_admin.AdminCommandsMixin
 gn = games.guess_number
 dc = games.dice
 rp = games.rps
+rd = games.riddle
 
 
 class FakeSend:
@@ -132,6 +133,40 @@ def test_rps_resolve_matrix() -> None:
     assert rp.net_change(100, "draw", 2.0) == 0
 
 
+def test_riddle_check_answer() -> None:
+    assert rd.check_answer("雨", "雨") is True
+    assert rd.check_answer("雨", "下雨了") is True
+    assert rd.check_answer("花生", "花生") is True
+    assert rd.check_answer("月亮", "太阳") is False
+    assert rd.check_answer("月亮", "月 亮！") is True
+
+
+def test_riddle_process_guess() -> None:
+    state = rd.new_session("谜面", "雨", 5)
+    status, text = rd.process_guess(state, "太阳")
+    assert status == "wrong"
+    assert "还剩 4 次" in text
+    status, text = rd.process_guess(state, "雨")
+    assert status == "win"
+    assert "答案是「雨」" in text
+
+
+def test_riddle_process_guess_over() -> None:
+    state = rd.new_session("谜面", "雨", 1)
+    rd.process_guess(state, "太阳")
+    status, text = rd.process_guess(state, "太阳")
+    assert status == "over"
+    assert "答案是「雨」" in text
+
+
+def test_riddle_parse_llm_result() -> None:
+    riddle_text, answer = rd.parse_llm_result(
+        "谜面：弯弯的月儿小小的船\n答案：月亮"
+    )
+    assert riddle_text == "弯弯的月儿小小的船"
+    assert answer == "月亮"
+
+
 # ---- 命令测试 ----
 
 
@@ -184,6 +219,44 @@ async def test_guess_number_win_awards_points(plugin: PluginHarness) -> None:
 
 
 @pytest.mark.asyncio
+async def test_riddle_start_and_win_awards_points(plugin: PluginHarness) -> None:
+    await _seed_user(plugin, points=0)
+    result = await plugin.handle_game_riddle(
+        stream_id="s", user_id="user", group_id="group"
+    )
+    assert result == (True, "开始猜谜语", True)
+    assert "🧩 谜语" in plugin.ctx.send.messages[-1][0]
+    assert "group:user" in plugin._game_sessions
+
+    plugin._game_sessions["group:user"] = rd.new_session("谜面", "雨", 5)
+    result = await plugin.handle_game_riddle(
+        stream_id="s",
+        user_id="user",
+        group_id="group",
+        matched_groups={"answer": "下雨"},
+    )
+    assert result == (True, "猜谜语答对", True)
+    assert await plugin.db.get_points("group:user") == 200
+    assert "group:user" not in plugin._game_sessions
+
+
+@pytest.mark.asyncio
+async def test_riddle_over_cap_no_points(plugin: PluginHarness) -> None:
+    plugin.config.game.daily_earn_limit = 10
+    await _seed_user(plugin, points=0)
+    await plugin.db.settle("group:user", "group", "riddle", 0, 1, 10)
+    plugin._game_sessions["group:user"] = rd.new_session("谜面", "雨", 5)
+    result = await plugin.handle_game_riddle(
+        stream_id="s",
+        user_id="user",
+        group_id="group",
+        matched_groups={"answer": "雨"},
+    )
+    assert result == (True, "猜谜语答对", True)
+    assert await plugin.db.get_points("group:user") == 10
+
+
+@pytest.mark.asyncio
 async def test_admin_set_daily_limit_and_override(plugin: PluginHarness) -> None:
     result = await plugin.handle_game_admin_daily_limit(
         stream_id="s",
@@ -199,6 +272,29 @@ async def test_admin_set_daily_limit_and_override(plugin: PluginHarness) -> None
     harness2 = PluginHarness(plugin.db, config2)
     await harness2._apply_game_settings_overrides()
     assert config2.game.daily_earn_limit == 2000
+
+
+@pytest.mark.asyncio
+async def test_admin_set_riddle_reward_and_switch(plugin: PluginHarness) -> None:
+    result = await plugin.handle_game_admin_riddle_reward(
+        stream_id="s",
+        user_id="admin",
+        group_id="",
+        matched_groups={"value": "300"},
+    )
+    assert result == (True, "设置猜谜语奖励300", True)
+    assert plugin.config.game.riddle_reward == 300
+    assert await plugin.db.get_setting("game:riddle_reward") == "300"
+
+    result = await plugin.handle_game_admin_switch(
+        stream_id="s",
+        user_id="admin",
+        group_id="",
+        matched_groups={"game": "猜谜语", "state": "关"},
+    )
+    assert result == (True, "开关猜谜语", True)
+    assert plugin.config.game.riddle_enabled is False
+    assert await plugin.db.get_setting("game:riddle_enabled") == "0"
 
 
 @pytest.mark.asyncio

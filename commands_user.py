@@ -13,7 +13,7 @@ from maibot_sdk import Command
 
 from .config import FeedBotConfig
 from .db import AsyncDatabase, _Rollback
-from .games import dice, guess_number, rps
+from .games import dice, guess_number, riddle, rps
 from .utils import extract_nickname
 
 MAX_BATCH_QUANTITY = 99
@@ -857,6 +857,7 @@ class UserCommandsMixin:
             "/游戏 — 查看游戏列表",
             "/游戏规则 — 查看小游戏规则",
             "/游戏 猜数字 <数字> — 猜数字",
+            "/游戏 猜谜语 <答案> — 猜谜语",
             "/游戏 猜大小 <大|小> <下注> — 骰子猜大小",
             "/游戏 石头剪刀布 <石头|剪刀|布> <下注> — 猜拳",
             "/游戏排行 — 累计获得积分榜",
@@ -891,9 +892,11 @@ class UserCommandsMixin:
             "",
             "1. 猜数字（免费）— 猜中得积分",
             "   用法：/游戏 猜数字 <数字>",
-            "2. 骰子猜大小（下注）— 猜大/小",
+            "2. 猜谜语（免费）— AI出题，猜中得积分",
+            "   用法：/游戏 猜谜语 <答案>",
+            "3. 骰子猜大小（下注）— 猜大/小",
             "   用法：/游戏 猜大小 <大|小> <下注>",
-            "3. 石头剪刀布（下注）— 与Bot猜拳",
+            "4. 石头剪刀布（下注）— 与Bot猜拳",
             "   用法：/游戏 石头剪刀布 <石头|剪刀|布> <下注>",
             "",
             "💡 详细规则输入 /游戏规则",
@@ -929,6 +932,8 @@ class UserCommandsMixin:
             "",
             "猜数字：范围1-100，猜中得积分",
             f"  奖励 {self.config.game.guess_number_reward} 积分",
+            "猜谜语：AI出谜语，共5次机会",
+            f"  奖励 {self.config.game.riddle_reward} 积分",
             "骰子猜大小：大(4-6) 小(1-3)",
             "石头剪刀布：平局返还下注",
             f"下注范围：{self.config.game.min_bet}-{self.config.game.max_bet}",
@@ -1029,6 +1034,112 @@ class UserCommandsMixin:
         prefix = "🔽" if status == "low" else "🔼"
         await self.ctx.send.text(f"{prefix} {text}", stream_id)
         return True, "继续猜", True
+
+    # ---- 小游戏：猜谜语 ----
+
+    @Command(
+        "game_riddle",
+        description="猜谜语",
+        pattern=r"^/游戏\s+猜谜语(?:\s+(?P<answer>.+))?$",
+    )
+    async def handle_game_riddle(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏 猜谜语 命令。"""
+        if not user_id:
+            return False, "无法获取用户信息", True
+        if not group_id:
+            await self.ctx.send.text("猜谜语仅支持群聊使用", stream_id)
+            return False, "非群聊", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
+        if not self.config.game.riddle_enabled:
+            await self.ctx.send.text("猜谜语已关闭", stream_id)
+            return False, "游戏关闭", True
+
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+        answer_text = str(matched_groups.get("answer") or "").strip()
+
+        key = self.db.user_key(user_id, group_id)
+        session = self._game_sessions.get(key)
+        if session is not None and riddle.is_expired(session):
+            self._game_sessions.pop(key, None)
+            session = None
+
+        if session is None:
+            riddle_text, answer = await self._generate_riddle()
+            session = riddle.new_session(
+                riddle_text, answer, self.config.game.riddle_max_tries
+            )
+            self._game_sessions[key] = session
+            if not answer_text:
+                await self.ctx.send.text(
+                    f"🧩 谜语：{riddle_text}\n"
+                    f"共 {self.config.game.riddle_max_tries} 次机会\n"
+                    "回复 /游戏 猜谜语 <答案> 来回答",
+                    stream_id,
+                )
+                return True, "开始猜谜语", True
+
+        status, text = riddle.process_guess(session, answer_text)
+        if status == "win":
+            self._game_sessions.pop(key, None)
+            await self.db.ensure_user(user_id, "", group_id)
+            uid = self.db.user_key(user_id, group_id)
+            reward = self.config.game.riddle_reward
+            earned = await self.db.get_today_earned(uid)
+            if earned + reward <= self.config.game.daily_earn_limit:
+                new_points = await self.db.settle(
+                    uid, group_id, "riddle", 0, 1, reward
+                )
+                await self.ctx.send.text(
+                    f"🎉 {text}，获得 +{reward} 积分，当前 {new_points}",
+                    stream_id,
+                )
+            else:
+                await self.db.settle(uid, group_id, "riddle", 0, 1, 0)
+                await self.ctx.send.text(
+                    f"🎉 {text}，但今日积分已达上限，不获得积分", stream_id
+                )
+            return True, "猜谜语答对", True
+
+        if status == "over":
+            self._game_sessions.pop(key, None)
+            await self.ctx.send.text(f"😵 {text}，本局结束", stream_id)
+            return True, "猜谜语结束", True
+
+        await self.ctx.send.text(f"🤔 {text}", stream_id)
+        return True, "继续猜谜语", True
+
+    async def _generate_riddle(self) -> tuple[str, str]:
+        """生成谜语：优先使用 LLM，失败时使用兜底谜语池。"""
+        try:
+            llm = getattr(self.ctx, "llm", None)
+            if llm is not None and self.config.llm.enabled:
+                result = await llm.generate(
+                    prompt=(
+                        "你是一个猜谜语主持人。请生成一个中文谜语，"
+                        "答案为一个词或短语。严格按以下两行输出：\n"
+                        "谜面：<谜面>\n"
+                        "答案：<答案>"
+                    ),
+                    model=self.config.llm.effective_model,
+                    temperature=0.8,
+                    max_tokens=200,
+                )
+                if isinstance(result, dict) and result.get("response"):
+                    riddle_text, answer = riddle.parse_llm_result(result["response"])
+                    if riddle_text and answer:
+                        return riddle_text, answer
+        except Exception:
+            pass
+        return riddle.random_fallback()
 
     # ---- 小游戏：骰子猜大小 ----
 
