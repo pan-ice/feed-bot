@@ -7,6 +7,7 @@ import logging
 import sqlite3
 import threading
 import time
+from datetime import datetime, time as dt_time
 from typing import Any
 
 from .config import FeedBotConfig
@@ -478,6 +479,13 @@ class AsyncDatabase:
                 (nickname, uid, nickname),
             )
 
+    async def get_points(self, uid: str) -> int:
+        """返回用户当前积分余额。"""
+        row = await self.fetchone(
+            "SELECT points FROM users WHERE user_id = ?", (uid,)
+        )
+        return int(row[0]) if row else 0
+
     # ---- 插件设置（键值存储） ----
 
     async def get_setting(self, key: str) -> str | None:
@@ -496,6 +504,85 @@ class AsyncDatabase:
             """,
             (key, value),
         )
+
+    # ---- 小游戏数据 ----
+
+    async def settle(
+        self,
+        uid: str,
+        group_id: str,
+        game: str,
+        bet: int,
+        win: int,
+        points_change: int,
+    ) -> int | None:
+        """事务内结算一局游戏：更新积分并写入记录，返回新余额。"""
+
+        def tx(cursor: Any) -> int:
+            cursor.execute(
+                "UPDATE users SET points = MAX(0, points + ?) WHERE user_id = ?",
+                (points_change, uid),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("用户不存在")
+            cursor.execute(
+                """
+                INSERT INTO game_records (user_id, group_id, game, bet, win,
+                                          points_change, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (uid, group_id, game, bet, win, points_change, time.time()),
+            )
+            cursor.execute(
+                "SELECT points FROM users WHERE user_id = ?", (uid,)
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+
+        return await self.run_in_transaction(tx)
+
+    async def get_today_earned(self, uid: str) -> int:
+        """返回用户当天通过游戏累计获得的积分（不含消耗）。"""
+        start = datetime.combine(datetime.now().date(), dt_time.min).timestamp()
+        row = await self.fetchone(
+            """
+            SELECT COALESCE(SUM(points_change), 0)
+            FROM game_records
+            WHERE user_id = ? AND points_change > 0 AND created_at >= ?
+            """,
+            (uid, start),
+        )
+        return int(row[0]) if row else 0
+
+    async def get_ranking(
+        self, group_id: str, kind: str = "earned"
+    ) -> list[tuple[Any, ...]]:
+        """返回本群 TOP10，kind=earned 按累计获得，net 按净收益。"""
+        if kind == "net":
+            sql = """
+                SELECT COALESCE(u.nickname, ''), u.user_id,
+                       COALESCE(SUM(g.points_change), 0),
+                       COALESCE(SUM(CASE WHEN g.win = 1 THEN 1 ELSE 0 END), 0)
+                FROM game_records g
+                JOIN users u ON u.user_id = g.user_id
+                WHERE g.group_id = ?
+                GROUP BY g.user_id
+                ORDER BY 3 DESC, 4 DESC, g.user_id ASC
+                LIMIT 10
+            """
+        else:
+            sql = """
+                SELECT COALESCE(u.nickname, ''), u.user_id,
+                       COALESCE(SUM(CASE WHEN g.points_change > 0 THEN g.points_change ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN g.win = 1 THEN 1 ELSE 0 END), 0)
+                FROM game_records g
+                JOIN users u ON u.user_id = g.user_id
+                WHERE g.group_id = ?
+                GROUP BY g.user_id
+                ORDER BY 3 DESC, 4 DESC, g.user_id ASC
+                LIMIT 10
+            """
+        return await self.execute(sql, (group_id,))
 
     async def apply_satiety_decay_batch(self, decay_rate: float) -> None:
         """批量应用所有群的饱食度衰减（基于时间差），单条 SQL 高效完成。"""

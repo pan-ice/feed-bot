@@ -728,3 +728,226 @@ class AdminCommandsMixin:
 
         await self.ctx.send.text(f"✅ 本群道具「{item_name}」已下架", stream_id)
         return True, f"群下架{item_name}", True
+
+    # ---- 小游戏：配置覆盖与参数命令 ----
+
+    async def _apply_game_settings_overrides(self) -> None:
+        """从数据库读取小游戏管理员设置并同步到内存配置。"""
+        mapping: dict[str, tuple[str, Any]] = {
+            "game:daily_earn_limit": ("daily_earn_limit", int),
+            "game:guess_number_reward": ("guess_number_reward", int),
+            "game:min_bet": ("min_bet", int),
+            "game:max_bet": ("max_bet", int),
+            "game:guess_number_enabled": ("guess_number_enabled", lambda v: v == "1"),
+            "game:dice_enabled": ("dice_enabled", lambda v: v == "1"),
+            "game:rps_enabled": ("rps_enabled", lambda v: v == "1"),
+        }
+        for key, (attr, conv) in mapping.items():
+            raw = await self.db.get_setting(key)
+            if raw is None:
+                continue
+            try:
+                setattr(self.config.game, attr, conv(raw))
+            except (TypeError, ValueError):
+                continue
+
+    async def _check_game_admin(
+        self, stream_id: str, group_id: str, user_id: str
+    ) -> bool:
+        """小游戏管理命令的权限校验，失败时发送提示并返回 False。"""
+        if group_id:
+            if not await self._is_group_admin(group_id, user_id):
+                await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
+                return False
+        elif not self._is_bot_admin(user_id):
+            await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
+            return False
+        return True
+
+    async def _set_game_param(
+        self,
+        stream_id: str,
+        user_id: str,
+        group_id: str,
+        matched_groups: dict[str, Any],
+        *,
+        key: str,
+        attr: str,
+        value_text: str,
+        display: str,
+        validate: Any,
+    ) -> tuple[bool, str, bool]:
+        """小游戏参数的通用设置流程。"""
+        if not await self._check_game_admin(stream_id, group_id, user_id):
+            return False, "非管理员", True
+        if not value_text:
+            await self.ctx.send.text(f"用法：/游戏管理 {display} <数值>", stream_id)
+            return False, "参数缺失", True
+        try:
+            value = int(value_text)
+        except ValueError:
+            await self.ctx.send.text("数值必须是整数", stream_id)
+            return False, "数值格式错误", True
+        if error := validate(value):
+            await self.ctx.send.text(error, stream_id)
+            return False, "数值超范围", True
+        setattr(self.config.game, attr, value)
+        await self.db.set_setting(key, str(value))
+        await self.ctx.send.text(f"✅ {display}已设置为 {value}", stream_id)
+        return True, f"设置{display}{value}", True
+
+    @Command(
+        "game_admin_daily_limit",
+        description="设置每日积分获取上限（管理员）",
+        pattern=r"^/游戏管理\s+每日上限\s+(?P<value>\d+)$",
+    )
+    async def handle_game_admin_daily_limit(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏管理 每日上限 命令。"""
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+        return await self._set_game_param(
+            stream_id,
+            user_id,
+            group_id,
+            matched_groups,
+            key="game:daily_earn_limit",
+            attr="daily_earn_limit",
+            value_text=str(matched_groups.get("value") or ""),
+            display="每日积分获取上限",
+            validate=lambda v: None if v >= 1 else "数值必须大于等于 1",
+        )
+
+    @Command(
+        "game_admin_guess_reward",
+        description="设置猜数字奖励（管理员）",
+        pattern=r"^/游戏管理\s+猜数字\s+奖励\s+(?P<value>\d+)$",
+    )
+    async def handle_game_admin_guess_reward(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏管理 猜数字 奖励 命令。"""
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+        return await self._set_game_param(
+            stream_id,
+            user_id,
+            group_id,
+            matched_groups,
+            key="game:guess_number_reward",
+            attr="guess_number_reward",
+            value_text=str(matched_groups.get("value") or ""),
+            display="猜数字奖励",
+            validate=lambda v: None if v >= 1 else "数值必须大于等于 1",
+        )
+
+    @Command(
+        "game_admin_max_bet",
+        description="设置下注上限（管理员）",
+        pattern=r"^/游戏管理\s+下注上限\s+(?P<value>\d+)$",
+    )
+    async def handle_game_admin_max_bet(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏管理 下注上限 命令。"""
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+        return await self._set_game_param(
+            stream_id,
+            user_id,
+            group_id,
+            matched_groups,
+            key="game:max_bet",
+            attr="max_bet",
+            value_text=str(matched_groups.get("value") or ""),
+            display="下注上限",
+            validate=lambda v: (
+                None
+                if v >= self.config.game.min_bet
+                else "下注上限不能低于下注下限"
+            ),
+        )
+
+    @Command(
+        "game_admin_min_bet",
+        description="设置下注下限（管理员）",
+        pattern=r"^/游戏管理\s+下注下限\s+(?P<value>\d+)$",
+    )
+    async def handle_game_admin_min_bet(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏管理 下注下限 命令。"""
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+        return await self._set_game_param(
+            stream_id,
+            user_id,
+            group_id,
+            matched_groups,
+            key="game:min_bet",
+            attr="min_bet",
+            value_text=str(matched_groups.get("value") or ""),
+            display="下注下限",
+            validate=lambda v: (
+                None
+                if v >= 1 and v <= self.config.game.max_bet
+                else "下注下限必须大于等于1且不高于下注上限"
+            ),
+        )
+
+    @Command(
+        "game_admin_switch",
+        description="启停游戏（管理员）",
+        pattern=r"^/游戏管理\s+开关\s+(?P<game>猜数字|猜大小|石头剪刀布)\s+(?P<state>开|关)$",
+    )
+    async def handle_game_admin_switch(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏管理 开关 命令。"""
+        if not await self._check_game_admin(stream_id, group_id, user_id):
+            return False, "非管理员", True
+
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+        game = str(matched_groups.get("game") or "")
+        state = str(matched_groups.get("state") or "")
+        enabled = state == "开"
+
+        attr_map = {
+            "猜数字": ("guess_number_enabled", "game:guess_number_enabled"),
+            "猜大小": ("dice_enabled", "game:dice_enabled"),
+            "石头剪刀布": ("rps_enabled", "game:rps_enabled"),
+        }
+        attr, key = attr_map[game]
+        setattr(self.config.game, attr, enabled)
+        await self.db.set_setting(key, "1" if enabled else "0")
+        await self.ctx.send.text(
+            f"✅ {game}已{'开启' if enabled else '关闭'}", stream_id
+        )
+        return True, f"开关{game}", True

@@ -31,6 +31,7 @@ class FeedBotPlugin(
         self._running: bool = False
         self._decay_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._seek_feed_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._game_sessions: dict[str, dict] = {}
 
     # ---- 生命周期 ----
 
@@ -45,6 +46,8 @@ class FeedBotPlugin(
 
         # 将 config.toml 中的群管理员同步到数据库
         await self.db.sync_group_admins_from_config(self.config)
+        # 同步小游戏管理员参数覆盖
+        await self._apply_game_settings_overrides()
 
         self._running = True
         self._decay_task = asyncio.create_task(self._attr_decay_loop())
@@ -86,6 +89,7 @@ class FeedBotPlugin(
 
         # 同步 WebUI / config.toml 中的群管理员变更到数据库
         await self.db.sync_group_admins_from_config(self.config)
+        await self._apply_game_settings_overrides()
 
         self.ctx.logger.info(f"投喂插件配置已更新 (v{version})，重启后台任务")
 

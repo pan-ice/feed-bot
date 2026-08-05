@@ -13,7 +13,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用投喂插件")
-    config_version: str = Field(default="1.1.1", description="配置版本")
+    config_version: str = Field(default="2.0.0", description="配置版本")
 
 
 class AdminConfig(PluginConfigBase):
@@ -118,6 +118,65 @@ class FilterConfig(PluginConfigBase):
     )
 
 
+class GameConfig(PluginConfigBase):
+    """小游戏配置。"""
+
+    __ui_label__ = "游戏设置（game）"
+    __ui_icon__ = "gamepad"
+    __ui_order__ = 5
+
+    daily_earn_limit: int = Field(
+        default=1500,
+        description="每日积分获取上限",
+        json_schema_extra={"label": "每日积分获取上限（daily_earn_limit）"},
+    )
+    guess_number_reward: int = Field(
+        default=20,
+        description="猜数字奖励积分",
+        json_schema_extra={"label": "猜数字奖励积分（guess_number_reward）"},
+    )
+    guess_number_max_tries: int = Field(
+        default=7,
+        description="猜数字每局最大次数",
+        json_schema_extra={"label": "猜数字最大次数（guess_number_max_tries）"},
+    )
+    min_bet: int = Field(
+        default=10,
+        description="下注下限",
+        json_schema_extra={"label": "下注下限（min_bet）"},
+    )
+    max_bet: int = Field(
+        default=500,
+        description="下注上限",
+        json_schema_extra={"label": "下注上限（max_bet）"},
+    )
+    dice_win_multiplier: float = Field(
+        default=2.0,
+        description="猜大小赔率（含本金）",
+        json_schema_extra={"label": "猜大小赔率（dice_win_multiplier）"},
+    )
+    rps_win_multiplier: float = Field(
+        default=2.0,
+        description="石头剪刀布赔率（含本金）",
+        json_schema_extra={"label": "石头剪刀布赔率（rps_win_multiplier）"},
+    )
+    guess_number_enabled: bool = Field(
+        default=True,
+        description="猜数字开关",
+        json_schema_extra={"label": "猜数字开关（guess_number_enabled）"},
+    )
+    dice_enabled: bool = Field(
+        default=True,
+        description="猜大小开关",
+        json_schema_extra={"label": "猜大小开关（dice_enabled）"},
+    )
+    rps_enabled: bool = Field(
+        default=True,
+        description="石头剪刀布开关",
+        json_schema_extra={"label": "石头剪刀布开关（rps_enabled）"},
+    )
+
+
 class LLMConfig(PluginConfigBase):
     """LLM回复配置。"""
 
@@ -145,4 +204,5 @@ class FeedBotConfig(PluginConfigBase):
     sign: SignConfig = Field(default_factory=SignConfig)
     bot_attr: BotAttrConfig = Field(default_factory=BotAttrConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
+    game: GameConfig = Field(default_factory=GameConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)

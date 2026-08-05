@@ -13,6 +13,7 @@ from maibot_sdk import Command
 
 from .config import FeedBotConfig
 from .db import AsyncDatabase, _Rollback
+from .games import dice, guess_number, rps
 from .utils import extract_nickname
 
 MAX_BATCH_QUANTITY = 99
@@ -857,3 +858,359 @@ class UserCommandsMixin:
 
         await self.ctx.send.text("\n".join(lines), stream_id)
         return True, "投喂规则", True
+
+    # ---- 小游戏：菜单与规则 ----
+
+    @Command("game_menu", description="查看游戏列表", pattern=r"^/游戏$")
+    async def handle_game_menu(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏 命令。"""
+        del kwargs
+
+        if not user_id:
+            return False, "无法获取用户信息", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
+
+        lines = [
+            "🎮 小游戏列表",
+            "",
+            "1. 猜数字（免费）— 猜中得积分",
+            "   用法：/游戏 猜数字 <数字>",
+            "2. 骰子猜大小（下注）— 猜大/小",
+            "   用法：/游戏 猜大小 <大|小> <下注>",
+            "3. 石头剪刀布（下注）— 与Bot猜拳",
+            "   用法：/游戏 石头剪刀布 <石头|剪刀|布> <下注>",
+            "",
+            "💡 详细规则输入 /游戏规则",
+            "🏆 排行榜输入 /游戏排行",
+        ]
+        await self.ctx.send.text("\n".join(lines), stream_id)
+        return True, "游戏列表", True
+
+    @Command("game_rules", description="查看游戏规则", pattern=r"^/游戏规则$")
+    async def handle_game_rules(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏规则 命令。"""
+        del kwargs
+
+        if not user_id:
+            return False, "无法获取用户信息", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
+
+        lines = [
+            "📖 小游戏规则",
+            "",
+            "• 积分互通：游戏积分与投喂插件共用余额",
+            "• 积分可直接在 /商店 购买道具",
+            f"• 每日获取积分上限：{self.config.game.daily_earn_limit}",
+            "• 达到上限后禁止下注，仅可游玩免费游戏",
+            "• 免费游戏达到上限后不再发放积分",
+            "",
+            "猜数字：范围1-100，猜中得积分",
+            f"  奖励 {self.config.game.guess_number_reward} 积分",
+            "骰子猜大小：大(4-6) 小(1-3)",
+            "石头剪刀布：平局返还下注",
+            f"下注范围：{self.config.game.min_bet}-{self.config.game.max_bet}",
+            "",
+            "排行榜：/游戏排行（累计获得）",
+            "        /游戏排行 净收益",
+        ]
+        await self.ctx.send.text("\n".join(lines), stream_id)
+        return True, "游戏规则", True
+
+    # ---- 小游戏：猜数字 ----
+
+    @Command(
+        "game_guess_number",
+        description="猜数字",
+        pattern=r"^/游戏\s+猜数字(?:\s+(?P<num>\d+))?$",
+    )
+    async def handle_game_guess_number(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏 猜数字 命令。"""
+        if not user_id:
+            return False, "无法获取用户信息", True
+        if not group_id:
+            await self.ctx.send.text("猜数字仅支持群聊使用", stream_id)
+            return False, "非群聊", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
+        if not self.config.game.guess_number_enabled:
+            await self.ctx.send.text("猜数字已关闭", stream_id)
+            return False, "游戏关闭", True
+
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+        num_text = str(matched_groups.get("num") or "").strip()
+
+        key = self.db.user_key(user_id, group_id)
+        session = self._game_sessions.get(key)
+        if session is not None and guess_number.is_expired(session):
+            self._game_sessions.pop(key, None)
+            session = None
+
+        if not num_text:
+            self._game_sessions[key] = guess_number.new_game(
+                self.config.game.guess_number_max_tries
+            )
+            await self.ctx.send.text(
+                "🎯 猜数字开始！范围 1-100，"
+                f"共 {self.config.game.guess_number_max_tries} 次机会\n"
+                "回复 /游戏 猜数字 <数字> 开始猜",
+                stream_id,
+            )
+            return True, "开始猜数字", True
+
+        num = int(num_text)
+        if num < 1 or num > 100:
+            await self.ctx.send.text("请输入 1-100 之间的数字", stream_id)
+            return False, "数字超范围", True
+
+        if session is None:
+            session = guess_number.new_game(
+                self.config.game.guess_number_max_tries
+            )
+            self._game_sessions[key] = session
+
+        status, text = guess_number.guess(session, num)
+        if status == "win":
+            self._game_sessions.pop(key, None)
+            await self.db.ensure_user(user_id, "", group_id)
+            uid = self.db.user_key(user_id, group_id)
+            reward = self.config.game.guess_number_reward
+            earned = await self.db.get_today_earned(uid)
+            if earned + reward <= self.config.game.daily_earn_limit:
+                new_points = await self.db.settle(
+                    uid, group_id, "guess_number", 0, 1, reward
+                )
+                await self.ctx.send.text(
+                    f"🎉 {text}，获得 +{reward} 积分，当前 {new_points}",
+                    stream_id,
+                )
+            else:
+                await self.db.settle(uid, group_id, "guess_number", 0, 1, 0)
+                await self.ctx.send.text(
+                    f"🎉 {text}，但今日积分已达上限，不获得积分", stream_id
+                )
+            return True, "猜中", True
+
+        if status == "over":
+            self._game_sessions.pop(key, None)
+            await self.ctx.send.text(f"😵 {text}，本局结束", stream_id)
+            return True, "猜数字结束", True
+
+        prefix = "🔽" if status == "low" else "🔼"
+        await self.ctx.send.text(f"{prefix} {text}", stream_id)
+        return True, "继续猜", True
+
+    # ---- 小游戏：骰子猜大小 ----
+
+    @Command(
+        "game_dice",
+        description="骰子猜大小",
+        pattern=r"^/游戏\s+猜大小\s+(?P<choice>大|小)\s+(?P<bet>\d+)$",
+    )
+    async def handle_game_dice(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏 猜大小 命令。"""
+        if not user_id:
+            return False, "无法获取用户信息", True
+        if not group_id:
+            await self.ctx.send.text("猜大小仅支持群聊使用", stream_id)
+            return False, "非群聊", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
+        if not self.config.game.dice_enabled:
+            await self.ctx.send.text("猜大小已关闭", stream_id)
+            return False, "游戏关闭", True
+
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+        choice = str(matched_groups.get("choice") or "").strip()
+        bet = int(str(matched_groups.get("bet") or "0"))
+
+        await self.db.ensure_user(user_id, "", group_id)
+        uid = self.db.user_key(user_id, group_id)
+        guard = await self._check_bet_guard(stream_id, uid, bet)
+        if guard is not None:
+            return guard
+
+        value = dice.roll()
+        win = dice.resolve(choice, value)
+        change = dice.net_change(bet, win, self.config.game.dice_win_multiplier)
+        new_points = await self.db.settle(
+            uid, group_id, "dice", bet, 1 if win else 0, change
+        )
+        size_label = "大" if value >= 4 else "小"
+        if win:
+            await self.ctx.send.text(
+                f"🎲 骰子 {value}（{size_label}），你猜{choice}，中了！"
+                f"净赚 +{change}，当前 {new_points}",
+                stream_id,
+            )
+        else:
+            await self.ctx.send.text(
+                f"🎲 骰子 {value}（{size_label}），你猜{choice}，没中"
+                f"扣除 {bet}，当前 {new_points}",
+                stream_id,
+            )
+        return True, f"猜大小{choice}", True
+
+    # ---- 小游戏：石头剪刀布 ----
+
+    @Command(
+        "game_rps",
+        description="石头剪刀布",
+        pattern=r"^/游戏\s+石头剪刀布\s+(?P<choice>石头|剪刀|布)\s+(?P<bet>\d+)$",
+    )
+    async def handle_game_rps(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏 石头剪刀布 命令。"""
+        if not user_id:
+            return False, "无法获取用户信息", True
+        if not group_id:
+            await self.ctx.send.text("石头剪刀布仅支持群聊使用", stream_id)
+            return False, "非群聊", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
+        if not self.config.game.rps_enabled:
+            await self.ctx.send.text("石头剪刀布已关闭", stream_id)
+            return False, "游戏关闭", True
+
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+        choice = str(matched_groups.get("choice") or "").strip()
+        bet = int(str(matched_groups.get("bet") or "0"))
+
+        await self.db.ensure_user(user_id, "", group_id)
+        uid = self.db.user_key(user_id, group_id)
+        guard = await self._check_bet_guard(stream_id, uid, bet)
+        if guard is not None:
+            return guard
+
+        bot = rps.bot_choice()
+        result = rps.resolve(choice, bot)
+        change = rps.net_change(bet, result, self.config.game.rps_win_multiplier)
+        win = 1 if result == "win" else 0
+        new_points = await self.db.settle(uid, group_id, "rps", bet, win, change)
+        if result == "win":
+            await self.ctx.send.text(
+                f"✂️ 你出{choice}，Bot出{bot}，你赢了！净赚 +{change}，当前 {new_points}",
+                stream_id,
+            )
+        elif result == "lose":
+            await self.ctx.send.text(
+                f"✂️ 你出{choice}，Bot出{bot}，你输了，扣除 {bet}，当前 {new_points}",
+                stream_id,
+            )
+        else:
+            await self.ctx.send.text(
+                f"✂️ 你出{choice}，Bot出{bot}，平局，下注返还，当前 {new_points}",
+                stream_id,
+            )
+        return True, f"石头剪刀布{choice}", True
+
+    # ---- 小游戏：排行榜 ----
+
+    @Command(
+        "game_ranking",
+        description="游戏排行榜",
+        pattern=r"^/游戏排行(?:\s+(?P<kind>净收益))?$",
+    )
+    async def handle_game_ranking(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏排行 命令。"""
+        if not user_id:
+            return False, "无法获取用户信息", True
+        if not group_id:
+            await self.ctx.send.text("排行榜仅支持群聊使用", stream_id)
+            return False, "非群聊", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
+
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+        kind = str(matched_groups.get("kind") or "").strip() or "earned"
+
+        rows = await self.db.get_ranking(group_id, kind)
+        if not rows:
+            await self.ctx.send.text("暂无游戏记录，快来 /游戏 玩一局吧！", stream_id)
+            return True, "无游戏记录", True
+
+        title = (
+            "🏆 游戏排行榜（净收益）"
+            if kind == "net"
+            else "🏆 游戏排行榜（累计获得积分）"
+        )
+        lines = [title]
+        for i, (nickname, uid, score, wins) in enumerate(rows, 1):
+            display_uid = uid.split(":", 1)[-1] if ":" in uid else uid
+            display_name = nickname or display_uid
+            lines.append(f"  {i}. {display_name} — {score}积分 胜{wins}次")
+        await self.ctx.send.text("\n".join(lines), stream_id)
+        return True, "游戏排行", True
+
+    # ---- 小游戏：公共校验 ----
+
+    async def _check_bet_guard(
+        self,
+        stream_id: str,
+        uid: str,
+        bet: int,
+    ) -> tuple[bool, str, bool] | None:
+        """下注前置校验：每日上限、下注范围、余额。通过返回 None。"""
+        earned = await self.db.get_today_earned(uid)
+        if earned >= self.config.game.daily_earn_limit:
+            await self.ctx.send.text(
+                "今日游戏积分已达上限，仅可游玩免费游戏", stream_id
+            )
+            return False, "已达上限", True
+        if bet < self.config.game.min_bet or bet > self.config.game.max_bet:
+            await self.ctx.send.text(
+                f"下注必须在 {self.config.game.min_bet}-{self.config.game.max_bet} 之间",
+                stream_id,
+            )
+            return False, "下注超范围", True
+        points = await self.db.get_points(uid)
+        if points < bet:
+            await self.ctx.send.text(
+                f"积分不足！需要 {bet} 积分，你只有 {points}", stream_id
+            )
+            return False, "积分不足", True
+        return None

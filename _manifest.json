@@ -1,19 +1,19 @@
 {
   "manifest_version": 2,
-  "id": "github.pan-ice.plugins-feed-bot",
-  "version": "1.1.1",
-  "name": "投喂插件",
-  "description": "签到积分+商店道具+投喂Bot+定时求投喂，支持群内商店、群管理员授权、按群隔离数据。",
+  "id": "worldcopyist.feed-entertainment",
+  "version": "2.0.0",
+  "name": "投喂娱乐插件",
+  "description": "签到积分+商店道具+投喂Bot+定时求投喂+小游戏，积分互通，支持群内商店、群管理员授权、按群隔离数据。",
   "author": {
-    "name": "磐冰",
-    "url": "https://github.com/pan-ice"
+    "name": "worldcopyist",
+    "url": "https://github.com/worldcopyist"
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/pan-ice/feed-bot",
-    "homepage": "https://github.com/pan-ice/feed-bot",
-    "documentation": "https://github.com/pan-ice/feed-bot/blob/main/README.md",
-    "issues": "https://github.com/pan-ice/feed-bot/issues"
+    "repository": "https://github.com/worldcopyist/feed-bot",
+    "homepage": "https://github.com/worldcopyist/feed-bot",
+    "documentation": "https://github.com/worldcopyist/feed-bot/blob/main/README.md",
+    "issues": "https://github.com/worldcopyist/feed-bot/issues"
   },
   "host_application": {
     "min_version": "1.0.0",
