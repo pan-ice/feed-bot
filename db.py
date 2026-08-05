@@ -216,6 +216,14 @@ class AsyncDatabase:
         )
         self._db.execute(
             """
+            CREATE TABLE IF NOT EXISTS plugin_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        self._db.execute(
+            """
             CREATE TABLE IF NOT EXISTS shop_items (
                 item_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -442,6 +450,25 @@ class AsyncDatabase:
                 "UPDATE users SET nickname = ? WHERE user_id = ? AND nickname != ?",
                 (nickname, uid, nickname),
             )
+
+    # ---- 插件设置（键值存储） ----
+
+    async def get_setting(self, key: str) -> str | None:
+        """读取插件键值设置，不存在返回 None。"""
+        row = await self.fetchone(
+            "SELECT value FROM plugin_settings WHERE key = ?", (key,)
+        )
+        return row[0] if row else None
+
+    async def set_setting(self, key: str, value: str) -> None:
+        """写入插件键值设置（存在则覆盖）。"""
+        await self.execute_commit(
+            """
+            INSERT INTO plugin_settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
 
     async def apply_satiety_decay_batch(self, decay_rate: float) -> None:
         """批量应用所有群的饱食度衰减（基于时间差），单条 SQL 高效完成。"""

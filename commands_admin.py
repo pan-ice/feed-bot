@@ -438,6 +438,49 @@ class AdminCommandsMixin:
         return True, f"重置签到{target_user}", True
 
     @Command(
+        "admin_set_sign_points",
+        description="设置签到基础积分（管理员）",
+        pattern=r"^/投喂管理\s+签到积分\s+(?P<value>\d+)$",
+    )
+    async def handle_admin_set_sign_points(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /投喂管理 签到积分 命令，设置每次签到获得的基础积分。"""
+        if group_id:
+            if not await self._is_group_admin(group_id, user_id):
+                await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
+                return False, "非管理员", True
+        elif not self._is_bot_admin(user_id):
+            await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
+            return False, "非管理员", True
+
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+
+        value_str = str(matched_groups.get("value") or "").strip()
+        if not value_str:
+            await self.ctx.send.text("用法：/投喂管理 签到积分 <数值>", stream_id)
+            return False, "参数缺失", True
+
+        try:
+            value = int(value_str)
+        except ValueError:
+            await self.ctx.send.text("数值必须是整数", stream_id)
+            return False, "数值格式错误", True
+
+        # 持久化到数据库，并同步内存配置
+        await self.db.set_setting("sign_base_points", str(value))
+        self.config.sign.base_points = value
+
+        await self.ctx.send.text(f"✅ 签到基础积分已设置为 {value}", stream_id)
+        return True, f"设置签到积分{value}", True
+
+    @Command(
         "admin_grant",
         description="授权群管理员（管理员）",
         pattern=r"^/投喂管理\s+授权\s+(?P<group_id>\S+)\s+(?P<target_user>\S+)$",
