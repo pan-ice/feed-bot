@@ -363,11 +363,16 @@ class AdminCommandsMixin:
         target_group = str(matched_groups.get("target_group") or "").strip()
 
         if not attr_key or not attr_value_str:
-            await self.ctx.send.text("用法：/投喂管理 属性 satiety <值> [群号]", stream_id)
+            await self.ctx.send.text(
+                "用法：/投喂管理 属性 <属性名> <值> [群号]（属性名支持 satiety / 饱食度）",
+                stream_id,
+            )
             return False, "参数缺失", True
 
-        if attr_key != "satiety":
-            await self.ctx.send.text("无效属性名，当前仅支持：satiety", stream_id)
+        if attr_key not in ("satiety", "饱食度"):
+            await self.ctx.send.text(
+                "无效属性名，当前仅支持：satiety / 饱食度", stream_id
+            )
             return False, "无效属性名", True
 
         effective_group = target_group or group_id
