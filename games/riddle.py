@@ -47,6 +47,10 @@ def new_session(riddle_text: str, answer: str, max_tries: int) -> dict:
     }
 
 
+def is_riddle_session(state: dict) -> bool:
+    """判断会话是否为猜谜语会话（防止与其他游戏会话混淆）。"""
+    return isinstance(state, dict) and "answer" in state and "tries_left" in state
+
 def is_expired(state: dict, timeout_seconds: int = 300) -> bool:
     """会话是否超时。"""
     return time.time() - state.get("started_at", 0) > timeout_seconds

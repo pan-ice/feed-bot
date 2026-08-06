@@ -324,6 +324,18 @@ class AsyncDatabase:
             ON game_records(group_id, created_at)
             """
         )
+        # 迁移：新增游戏会话表（持久化进行中的游戏，避免进程重启/多实例丢会话）
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_sessions (
+                user_id TEXT NOT NULL,
+                game TEXT NOT NULL,
+                state TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (user_id, game)
+            )
+            """
+        )
 
         # 迁移：添加投喂数量列（批量投喂记录）
         feed_record_columns = {
@@ -583,6 +595,53 @@ class AsyncDatabase:
                 LIMIT 10
             """
         return await self.execute(sql, (group_id,))
+
+    # ---- 游戏会话持久化（跨进程/重启恢复进行中的游戏） ----
+
+    async def save_game_session(self, user_id: str, game: str, state: dict) -> None:
+        """保存游戏会话状态（存在则覆盖）。"""
+        import json
+
+        await self.execute_commit(
+            """
+            INSERT INTO game_sessions (user_id, game, state, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, game) DO UPDATE SET
+                state = excluded.state,
+                updated_at = excluded.updated_at
+            """,
+            (user_id, game, json.dumps(state, ensure_ascii=False), time.time()),
+        )
+
+    async def load_game_session(self, user_id: str, game: str) -> dict | None:
+        """读取游戏会话状态，不存在或解析失败返回 None。"""
+        import json
+
+        row = await self.fetchone(
+            "SELECT state FROM game_sessions WHERE user_id = ? AND game = ?",
+            (user_id, game),
+        )
+        if row is None:
+            return None
+        try:
+            state = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        return state if isinstance(state, dict) else None
+
+    async def delete_game_session(self, user_id: str, game: str) -> None:
+        """删除游戏会话状态（不存在时静默忽略）。"""
+        await self.execute_commit(
+            "DELETE FROM game_sessions WHERE user_id = ? AND game = ?",
+            (user_id, game),
+        )
+
+    async def delete_all_game_sessions(self, user_id: str) -> None:
+        """删除该用户所有游戏会话（结束游戏指令用）。"""
+        await self.execute_commit(
+            "DELETE FROM game_sessions WHERE user_id = ?",
+            (user_id,),
+        )
 
     async def apply_satiety_decay_batch(self, decay_rate: float) -> None:
         """批量应用所有群的饱食度衰减（基于时间差），单条 SQL 高效完成。"""

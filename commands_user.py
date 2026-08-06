@@ -162,6 +162,7 @@ class UserCommandsMixin:
                 self.config.sign.max_consecutive_bonus,
             )
             lines.append(f"🔥 明天签到可获得额外奖励：{next_bonus}积分")
+        lines.append("🎮 使用/游戏 可以和我玩游戏哦")
 
         await self.ctx.send.text("\n".join(lines), stream_id)
         return True, f"签到获得{earned}积分", True
@@ -898,6 +899,8 @@ class UserCommandsMixin:
             "   用法：/游戏 猜大小 <大|小> <下注>",
             "4. 石头剪刀布（下注）— 与Bot猜拳",
             "   用法：/游戏 石头剪刀布 <石头|剪刀|布> <下注>",
+            "5. 结束游戏 — 结束当前进行中的游戏",
+            "   用法：/游戏 结束游戏",
             "",
             "💡 详细规则输入 /游戏规则",
             "🏆 排行榜输入 /游戏排行",
@@ -938,11 +941,46 @@ class UserCommandsMixin:
             "石头剪刀布：平局返还下注",
             f"下注范围：{self.config.game.min_bet}-{self.config.game.max_bet}",
             "",
+            "结束游戏：/游戏 结束游戏",
             "排行榜：/游戏排行（累计获得）",
             "        /游戏排行 净收益",
         ]
         await self.ctx.send.text("\n".join(lines), stream_id)
         return True, "游戏规则", True
+
+    @Command("game_end", description="结束当前游戏", pattern=r"^/游戏\s+结束游戏$")
+    async def handle_game_end(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /游戏 结束游戏 命令：结束该用户所有进行中的游戏。"""
+        del kwargs
+
+        if not user_id:
+            return False, "无法获取用户信息", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
+
+        key = self.db.user_key(user_id, group_id)
+        ended = False
+        if key in self._game_sessions:
+            self._game_sessions.pop(key, None)
+            ended = True
+        # 清理数据库中可能残留的会话（进程重启后内存为空的情况）
+        await self.db.delete_all_game_sessions(key)
+
+        if ended:
+            await self.ctx.send.text(
+                "🛑 游戏已结束，欢迎下次再来！回复 /游戏 查看游戏列表", stream_id
+            )
+            return True, "结束游戏", True
+        await self.ctx.send.text(
+            "当前没有进行中的游戏，回复 /游戏 查看游戏列表", stream_id
+        )
+        return True, "无进行中游戏", True
 
     # ---- 小游戏：猜数字 ----
 
@@ -1086,9 +1124,23 @@ class UserCommandsMixin:
 
         key = self.db.user_key(user_id, group_id)
         session = self._game_sessions.get(key)
+        # 内存会话可能来自其他游戏（key 相同），需校验是猜谜语会话
+        if session is not None and not riddle.is_riddle_session(session):
+            self._game_sessions.pop(key, None)
+            session = None
         if session is not None and riddle.is_expired(session):
             self._game_sessions.pop(key, None)
             session = None
+
+        if session is None:
+            # 内存无会话时尝试从数据库恢复（进程重启/多实例场景）
+            session = await self.db.load_game_session(key, "riddle")
+            if session is not None:
+                if riddle.is_expired(session):
+                    await self.db.delete_game_session(key, "riddle")
+                    session = None
+                else:
+                    self._game_sessions[key] = session
 
         if session is None:
             guard = await self._pay_participate(
@@ -1105,6 +1157,7 @@ class UserCommandsMixin:
                 riddle_text, answer, self.config.game.riddle_max_tries
             )
             self._game_sessions[key] = session
+            await self.db.save_game_session(key, "riddle", session)
             if not answer_text:
                 await self.ctx.send.text(
                     f"🧩 谜语：{riddle_text}\n"
@@ -1117,6 +1170,7 @@ class UserCommandsMixin:
         status, text = riddle.process_guess(session, answer_text)
         if status == "win":
             self._game_sessions.pop(key, None)
+            await self.db.delete_game_session(key, "riddle")
             await self.db.ensure_user(user_id, "", group_id)
             uid = self.db.user_key(user_id, group_id)
             reward = self.config.game.riddle_reward
@@ -1138,9 +1192,12 @@ class UserCommandsMixin:
 
         if status == "over":
             self._game_sessions.pop(key, None)
+            await self.db.delete_game_session(key, "riddle")
             await self.ctx.send.text(f"😵 {text}，本局结束", stream_id)
             return True, "猜谜语结束", True
 
+        # 猜错但未结束：同步剩余机会到数据库，防止进程重启丢进度
+        await self.db.save_game_session(key, "riddle", session)
         await self.ctx.send.text(f"🤔 {text}", stream_id)
         return True, "继续猜谜语", True
 
