@@ -84,10 +84,14 @@ async def plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         ("面包 X5", ("面包", 5, None)),
         ("面包 *5", ("面包", 5, None)),
         ("面包 ×5", ("面包", 5, None)),
+        ("面包 5", ("面包", 5, None)),
+        ("面包 99", ("面包", 99, None)),
+        ("面包 100", ("面包", 0, "单次最多操作99个道具")),
         ("面包 x0", ("面包", 0, "数量必须是正整数")),
         ("面包 x000", ("面包", 0, "数量必须是正整数")),
-        ("面包 x101", ("面包", 0, "单次最多操作100个道具")),
-        ("面包 x" + "9" * 5000, ("面包", 0, "单次最多操作100个道具")),
+        ("面包 x100", ("面包", 0, "单次最多操作99个道具")),
+        ("面包 x101", ("面包", 0, "单次最多操作99个道具")),
+        ("面包 x" + "9" * 5000, ("面包", 0, "单次最多操作99个道具")),
     ],
 )
 def test_parse_item_request(raw: str, expected: tuple[str, int, str | None]) -> None:
@@ -216,3 +220,32 @@ async def test_batch_feed_inventory_shortage_rolls_back(plugin: PluginHarness) -
     )
     assert satiety is not None
     assert satiety[0] == pytest.approx(50.0)
+
+
+@pytest.mark.asyncio
+async def test_sign_in_uses_db_override(plugin: PluginHarness) -> None:
+    await _seed_user_and_item(plugin, points=0)
+
+    # 默认基础积分 10
+    result = await plugin.handle_sign_in(
+        stream_id="stream", user_id="user", group_id="group"
+    )
+    assert result == (True, "签到获得10积分", True)
+    assert await plugin.db.fetchone(
+        "SELECT points FROM users WHERE user_id = 'group:user'"
+    ) == (10,)
+
+    # 管理员设置基础积分后，下一次签到使用新值
+    await plugin.db.set_setting("sign_base_points", "20")
+    await plugin.db.execute_commit(
+        "UPDATE users SET last_sign_time = ? WHERE user_id = 'group:user'",
+        (time.time() - 86400,),
+    )
+    result = await plugin.handle_sign_in(
+        stream_id="stream", user_id="user", group_id="group"
+    )
+    # 基础20 + 连续签到奖励5 = 25
+    assert result == (True, "签到获得25积分", True)
+    assert await plugin.db.fetchone(
+        "SELECT points FROM users WHERE user_id = 'group:user'"
+    ) == (35,)

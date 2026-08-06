@@ -363,11 +363,16 @@ class AdminCommandsMixin:
         target_group = str(matched_groups.get("target_group") or "").strip()
 
         if not attr_key or not attr_value_str:
-            await self.ctx.send.text("用法：/投喂管理 属性 satiety <值> [群号]", stream_id)
+            await self.ctx.send.text(
+                "用法：/投喂管理 属性 <属性名> <值> [群号]（属性名支持 satiety / 饱食度）",
+                stream_id,
+            )
             return False, "参数缺失", True
 
-        if attr_key != "satiety":
-            await self.ctx.send.text("无效属性名，当前仅支持：satiety", stream_id)
+        if attr_key not in ("satiety", "饱食度"):
+            await self.ctx.send.text(
+                "无效属性名，当前仅支持：satiety / 饱食度", stream_id
+            )
             return False, "无效属性名", True
 
         effective_group = target_group or group_id
@@ -436,6 +441,49 @@ class AdminCommandsMixin:
 
         await self.ctx.send.text(f"✅ 已重置 {target_user} 的签到记录", stream_id)
         return True, f"重置签到{target_user}", True
+
+    @Command(
+        "admin_set_sign_points",
+        description="设置签到基础积分（管理员）",
+        pattern=r"^/投喂管理\s+签到积分\s+(?P<value>\d+)$",
+    )
+    async def handle_admin_set_sign_points(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /投喂管理 签到积分 命令，设置每次签到获得的基础积分。"""
+        if group_id:
+            if not await self._is_group_admin(group_id, user_id):
+                await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
+                return False, "非管理员", True
+        elif not self._is_bot_admin(user_id):
+            await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
+            return False, "非管理员", True
+
+        matched_groups = kwargs.get("matched_groups")
+        if not isinstance(matched_groups, dict):
+            matched_groups = {}
+
+        value_str = str(matched_groups.get("value") or "").strip()
+        if not value_str:
+            await self.ctx.send.text("用法：/投喂管理 签到积分 <数值>", stream_id)
+            return False, "参数缺失", True
+
+        try:
+            value = int(value_str)
+        except ValueError:
+            await self.ctx.send.text("数值必须是整数", stream_id)
+            return False, "数值格式错误", True
+
+        # 持久化到数据库，并同步内存配置
+        await self.db.set_setting("sign_base_points", str(value))
+        self.config.sign.base_points = value
+
+        await self.ctx.send.text(f"✅ 签到基础积分已设置为 {value}", stream_id)
+        return True, f"设置签到积分{value}", True
 
     @Command(
         "admin_grant",

@@ -216,6 +216,14 @@ class AsyncDatabase:
         )
         self._db.execute(
             """
+            CREATE TABLE IF NOT EXISTS plugin_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        self._db.execute(
+            """
             CREATE TABLE IF NOT EXISTS shop_items (
                 item_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -443,6 +451,25 @@ class AsyncDatabase:
                 (nickname, uid, nickname),
             )
 
+    # ---- 插件设置（键值存储） ----
+
+    async def get_setting(self, key: str) -> str | None:
+        """读取插件键值设置，不存在返回 None。"""
+        row = await self.fetchone(
+            "SELECT value FROM plugin_settings WHERE key = ?", (key,)
+        )
+        return row[0] if row else None
+
+    async def set_setting(self, key: str, value: str) -> None:
+        """写入插件键值设置（存在则覆盖）。"""
+        await self.execute_commit(
+            """
+            INSERT INTO plugin_settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+
     async def apply_satiety_decay_batch(self, decay_rate: float) -> None:
         """批量应用所有群的饱食度衰减（基于时间差），单条 SQL 高效完成。"""
         now = time.time()
@@ -490,6 +517,16 @@ class AsyncDatabase:
             return initial
 
         satiety, last_decay_time = row[0], row[1]
+        # 记录存在但饱食度未初始化（如仅配置了群管理员时写入的 -1），
+        # 回退为初始饱食度并写回，避免 /饱食度 显示异常值
+        if satiety < 0:
+            initial = config.bot_attr.initial_satiety
+            now = time.time()
+            await self.execute_commit(
+                "UPDATE feed_groups SET satiety = ?, last_decay_time = ? WHERE group_id = ?",
+                (initial, now, group_id),
+            )
+            return initial
         # 补偿衰减（仅计算，不写回——写回由衰减循环统一负责）
         if last_decay_time > 0:
             hours_elapsed = (time.time() - last_decay_time) / 3600.0

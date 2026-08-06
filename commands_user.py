@@ -15,21 +15,24 @@ from .config import FeedBotConfig
 from .db import AsyncDatabase, _Rollback
 from .utils import extract_nickname
 
-MAX_BATCH_QUANTITY = 100
+MAX_BATCH_QUANTITY = 99
 
 
 def parse_item_request(raw: str) -> tuple[str, int, str | None]:
-    """解析道具名和可选的 x数量 后缀。"""
+    """解析道具名和可选的数量后缀（如 x5 或 5）。"""
     value = raw.strip()
     if not value:
         return "", 0, "缺少道具名"
 
-    match = re.match(r"^(?P<item_name>.+?)(?:\s+[xX*×](?P<quantity>\S+))?$", value)
+    match = re.match(
+        r"^(?P<item_name>.+?)(?:\s+(?:[xX*×](?P<quantity>\S+)|(?P<plain_quantity>\d+)))?$",
+        value,
+    )
     if match is None:
         return "", 0, "参数格式错误"
 
     item_name = match.group("item_name").strip()
-    quantity_text = match.group("quantity")
+    quantity_text = match.group("quantity") or match.group("plain_quantity")
     if quantity_text is None:
         return item_name, 1, None
     if not quantity_text.isdigit() or quantity_text == "0":
@@ -51,7 +54,7 @@ def parse_item_request(raw: str) -> tuple[str, int, str | None]:
 
 
 class UserCommandsMixin:
-    """用户命令：签到、积分、商店、购买、背包、投喂、投喂记录、饱食度、投喂排行。"""
+    """用户命令：签到、积分、商店、购买、背包、投喂、投喂记录、饱食度、投喂排行、投喂规则。"""
 
     # 这些属性由 FeedBotPlugin 提供，类型标注仅供静态分析
     db: AsyncDatabase
@@ -81,6 +84,17 @@ class UserCommandsMixin:
 
         uid = self.db.user_key(user_id, group_id)
 
+        # 签到基础积分：优先使用管理员通过 /投喂管理 签到积分 设置的值
+        sign_base_override = await self.db.get_setting("sign_base_points")
+        try:
+            sign_base = (
+                int(sign_base_override)
+                if sign_base_override is not None
+                else self.config.sign.base_points
+            )
+        except (TypeError, ValueError):
+            sign_base = self.config.sign.base_points
+
         # 在事务中原子完成：读取签到状态 + 判断 + 更新，防止 TOCTOU
         def _sign_tx(cursor: Any) -> tuple[bool, int, int, int, int] | None:
             now_ts = time.time()
@@ -108,7 +122,7 @@ class UserCommandsMixin:
 
             total_days += 1
 
-            base = self.config.sign.base_points
+            base = sign_base
             bonus = min(
                 (consecutive_days - 1) * self.config.sign.consecutive_bonus,
                 self.config.sign.max_consecutive_bonus,
@@ -135,7 +149,7 @@ class UserCommandsMixin:
             await self.ctx.send.text("你今天已经签到过了～明天再来吧！", stream_id)
             return True, "已签到", True
 
-        base = self.config.sign.base_points
+        base = sign_base
         lines = [
             "✅ 签到成功！",
             f"💰 获得积分：{earned}（基础{base} + 连续奖励{bonus}）",
@@ -277,25 +291,42 @@ class UserCommandsMixin:
             await self.ctx.send.text("商店空空如也～等管理员上架道具吧！", stream_id)
             return True, "商店为空", True
 
+        def _item_line(
+            name: str, emoji: str, price: int, desc: str, satiety_bonus: float
+        ) -> str:
+            display = f"{emoji}{name}" if emoji else name
+            desc_part = f" — {desc}" if desc else ""
+            return f"  {display} {price}积分 饱食度{satiety_bonus:+}{desc_part}"
+
         lines: list[str] = []
 
         if global_items:
             lines.append("🌐 全局道具")
-            for name, emoji, price, desc, _cat, satiety_bonus in global_items:
-                display = f"{emoji}{name}" if emoji else name
-                desc_part = f" — {desc}" if desc else ""
-                lines.append(f"  {display} {price}积分 饱食度{satiety_bonus:+}{desc_part}")
+            lines.append("")
+            for index, (name, emoji, price, desc, _cat, satiety_bonus) in enumerate(
+                global_items
+            ):
+                if index > 0:
+                    lines.append("")  # 每个商品之间隔一行，便于查看
+                lines.append(_item_line(name, emoji, price, desc, satiety_bonus))
 
         if group_items:
-            lines.append("")
+            if lines:
+                lines.append("")
             lines.append("🏠 本群专属")
-            for name, emoji, price, desc, _cat, satiety_bonus in group_items:
-                display = f"{emoji}{name}" if emoji else name
-                desc_part = f" — {desc}" if desc else ""
-                lines.append(f"  {display} {price}积分 饱食度{satiety_bonus:+}{desc_part}")
+            lines.append("")
+            for index, (name, emoji, price, desc, _cat, satiety_bonus) in enumerate(
+                group_items
+            ):
+                if index > 0:
+                    lines.append("")
+                lines.append(_item_line(name, emoji, price, desc, satiety_bonus))
 
-        lines.append("")
-        lines.append("💡 使用 /购买 <道具名> 购买道具")
+        if lines:
+            lines.append("")
+        lines.append(
+            f"💡 使用 /购买 <道具名> [x数量] 购买道具，单次最多{MAX_BATCH_QUANTITY}个"
+        )
 
         await self.ctx.send.text("\n".join(lines), stream_id)
         return True, "查看商店", True
@@ -322,7 +353,9 @@ class UserCommandsMixin:
         item_name, quantity, error = parse_item_request(item_request)
         if error:
             await self.ctx.send.text(
-                f"{error}。用法：/购买 <道具名> [x数量]", stream_id
+                f"{error}。用法：/购买 <道具名> [x数量]，"
+                f"单次最多{MAX_BATCH_QUANTITY}个",
+                stream_id,
             )
             return False, error, True
 
@@ -459,7 +492,9 @@ class UserCommandsMixin:
         item_name, requested_quantity, error = parse_item_request(item_request)
         if error:
             await self.ctx.send.text(
-                f"{error}。用法：/投喂 <道具名> [x数量]", stream_id
+                f"{error}。用法：/投喂 <道具名> [x数量]，"
+                f"单次最多{MAX_BATCH_QUANTITY}个",
+                stream_id,
             )
             return False, error, True
 
@@ -782,3 +817,43 @@ class UserCommandsMixin:
 
         await self.ctx.send.text("\n".join(lines), stream_id)
         return True, "投喂排行", True
+
+    # ---- 规则命令 ----
+
+    @Command("feed_rules", description="查看普通用户可用指令", pattern=r"^/投喂规则$")
+    async def handle_feed_rules(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        """处理 /投喂规则 命令，列出非管理员可使用的所有指令。"""
+        del kwargs
+
+        if not user_id:
+            return False, "无法获取用户信息", True
+        if not self._check_group_enabled(group_id):
+            return False, "群未授权", True
+
+        lines = [
+            "📖 投喂规则",
+            "以下指令所有成员均可使用：",
+            "",
+            "/签到 — 每日签到获取积分",
+            "/积分 — 查看积分余额",
+            "/积分排行 — 查看本群积分排行",
+            "/商店 — 查看可购买道具",
+            f"/购买 <道具名> [x数量] — 购买道具，单次最多{MAX_BATCH_QUANTITY}个",
+            "/背包 — 查看背包道具",
+            f"/投喂 <道具名> [x数量] — 投喂Bot，单次最多{MAX_BATCH_QUANTITY}个",
+            "/投喂记录 — 查看投喂历史",
+            "/饱食度 — 查看当前饱食度",
+            "/投喂排行 — 查看本群投喂排行",
+            "/投喂规则 — 查看本规则",
+            "",
+            "管理员另有 /投喂管理 系列指令，仅管理员可执行",
+        ]
+
+        await self.ctx.send.text("\n".join(lines), stream_id)
+        return True, "投喂规则", True
