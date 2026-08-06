@@ -2,6 +2,7 @@ from importlib import util
 from pathlib import Path
 from typing import Any
 
+import re
 import sys
 import time
 
@@ -28,12 +29,16 @@ def _load_plugin_package() -> None:
 
 _load_plugin_package()
 
+commands_admin = __import__(f"{PACKAGE_NAME}.commands_admin", fromlist=["*"])
 commands_user = __import__(f"{PACKAGE_NAME}.commands_user", fromlist=["*"])
 config_module = __import__(f"{PACKAGE_NAME}.config", fromlist=["*"])
 db_module = __import__(f"{PACKAGE_NAME}.db", fromlist=["*"])
 
+AdminCommandsMixin = commands_admin.AdminCommandsMixin
 AsyncDatabase = db_module.AsyncDatabase
 FeedBotConfig = config_module.FeedBotConfig
+MAX_SIGN_BASE_POINTS = config_module.MAX_SIGN_BASE_POINTS
+SET_SIGN_POINTS_COMMAND_PATTERN = commands_admin.SET_SIGN_POINTS_COMMAND_PATTERN
 UserCommandsMixin = commands_user.UserCommandsMixin
 parse_item_request = commands_user.parse_item_request
 
@@ -51,10 +56,11 @@ class FakeContext:
         self.send = FakeSend()
 
 
-class PluginHarness(UserCommandsMixin):
+class PluginHarness(UserCommandsMixin, AdminCommandsMixin):
     def __init__(self, db: AsyncDatabase) -> None:
         self.db = db
         self.config = FeedBotConfig()
+        self.config.admin.admin_users = ["bot-admin"]
         self.ctx = FakeContext()
 
     def _check_group_enabled(self, group_id: str) -> bool:
@@ -87,6 +93,9 @@ async def plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         ("面包 5", ("面包", 5, None)),
         ("面包 99", ("面包", 99, None)),
         ("面包 100", ("面包", 0, "单次最多操作99个道具")),
+        ("面包 -1", ("面包", 0, "数量必须是正整数")),
+        ("面包 +1", ("面包", 0, "数量必须是正整数")),
+        ("面包 1.5", ("面包", 0, "数量必须是正整数")),
         ("面包 x0", ("面包", 0, "数量必须是正整数")),
         ("面包 x000", ("面包", 0, "数量必须是正整数")),
         ("面包 x100", ("面包", 0, "单次最多操作99个道具")),
@@ -235,8 +244,15 @@ async def test_sign_in_uses_db_override(plugin: PluginHarness) -> None:
         "SELECT points FROM users WHERE user_id = 'group:user'"
     ) == (10,)
 
-    # 管理员设置基础积分后，下一次签到使用新值
-    await plugin.db.set_setting("sign_base_points", "20")
+    # Bot管理员私聊设置基础积分后，下一次签到使用持久化覆盖值
+    setting_result = await plugin.handle_admin_set_sign_points(
+        stream_id="stream",
+        user_id="bot-admin",
+        matched_groups={"value": "20"},
+    )
+    assert setting_result == (True, "设置签到积分20", True)
+    assert await plugin.db.get_setting("sign_base_points") == "20"
+    assert plugin.config.sign.base_points == 10
     await plugin.db.execute_commit(
         "UPDATE users SET last_sign_time = ? WHERE user_id = 'group:user'",
         (time.time() - 86400,),
@@ -249,3 +265,124 @@ async def test_sign_in_uses_db_override(plugin: PluginHarness) -> None:
     assert await plugin.db.fetchone(
         "SELECT points FROM users WHERE user_id = 'group:user'"
     ) == (35,)
+    assert "基础20 + 连续奖励5" in plugin.ctx.send.messages[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_set_sign_points_requires_bot_admin_private_chat(
+    plugin: PluginHarness,
+) -> None:
+    group_result = await plugin.handle_admin_set_sign_points(
+        stream_id="stream",
+        user_id="bot-admin",
+        group_id="group",
+        matched_groups={"value": "20"},
+    )
+    assert group_result == (False, "非私聊", True)
+
+    user_result = await plugin.handle_admin_set_sign_points(
+        stream_id="stream",
+        user_id="user",
+        matched_groups={"value": "20"},
+    )
+    assert user_result == (False, "非管理员", True)
+    assert await plugin.db.get_setting("sign_base_points") is None
+
+
+@pytest.mark.asyncio
+async def test_set_sign_points_validates_input_range(plugin: PluginHarness) -> None:
+    invalid_result = await plugin.handle_admin_set_sign_points(
+        stream_id="stream",
+        user_id="bot-admin",
+        matched_groups={"value": "abc"},
+    )
+    assert invalid_result == (False, "数值格式错误", True)
+
+    overflow_result = await plugin.handle_admin_set_sign_points(
+        stream_id="stream",
+        user_id="bot-admin",
+        matched_groups={"value": str(MAX_SIGN_BASE_POINTS + 1)},
+    )
+    assert overflow_result == (False, "数值超出范围", True)
+    assert await plugin.db.get_setting("sign_base_points") is None
+
+    boundary_result = await plugin.handle_admin_set_sign_points(
+        stream_id="stream",
+        user_id="bot-admin",
+        matched_groups={"value": str(MAX_SIGN_BASE_POINTS)},
+    )
+    assert boundary_result == (
+        True,
+        f"设置签到积分{MAX_SIGN_BASE_POINTS}",
+        True,
+    )
+    assert await plugin.db.get_setting("sign_base_points") == str(
+        MAX_SIGN_BASE_POINTS
+    )
+
+
+@pytest.mark.asyncio
+async def test_sign_in_rejects_invalid_persisted_override(
+    plugin: PluginHarness,
+) -> None:
+    await plugin.db.set_setting("sign_base_points", "invalid")
+
+    with pytest.raises(ValueError, match="sign_base_points 不是整数"):
+        await plugin.handle_sign_in(
+            stream_id="stream", user_id="user", group_id="group"
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_satiety_initializes_admin_only_group(plugin: PluginHarness) -> None:
+    await plugin.db.set_group_admins("group", ["group-admin"])
+
+    satiety = await plugin.db.get_satiety("group", plugin.config)
+
+    assert satiety == pytest.approx(plugin.config.bot_attr.initial_satiety)
+    row = await plugin.db.fetchone(
+        "SELECT satiety, last_decay_time, group_admin_users "
+        "FROM feed_groups WHERE group_id = 'group'"
+    )
+    assert row is not None
+    assert row[0] == pytest.approx(plugin.config.bot_attr.initial_satiety)
+    assert row[1] > 0
+    assert row[2] == "group-admin"
+
+
+@pytest.mark.asyncio
+async def test_feed_rules_separates_group_only_commands(plugin: PluginHarness) -> None:
+    result = await plugin.handle_feed_rules(
+        stream_id="stream", user_id="user", group_id=""
+    )
+
+    assert result == (True, "投喂规则", True)
+    content = plugin.ctx.send.messages[-1][0]
+    assert "通用指令：" in content
+    assert "群聊指令：" in content
+
+
+def test_bot_attr_schema_uses_bilingual_labels() -> None:
+    schema = FeedBotConfig.model_json_schema()
+    fields = schema["$defs"]["BotAttrConfig"]["properties"]
+
+    assert fields["initial_satiety"]["label"] == "初始饱食度（initial_satiety）"
+    assert fields["seek_feed_messages"]["label"] == "求投喂消息（seek_feed_messages）"
+
+
+@pytest.mark.parametrize(
+    ("command", "value"),
+    [
+        ("/投喂管理 签到积分", None),
+        ("/投喂管理 签到积分 abc", "abc"),
+        ("/投喂管理 签到积分 -1", "-1"),
+        ("/投喂管理 签到积分 20", "20"),
+    ],
+)
+def test_set_sign_points_command_captures_raw_value(
+    command: str, value: str | None
+) -> None:
+    matched = re.fullmatch(SET_SIGN_POINTS_COMMAND_PATTERN, command)
+
+    assert matched is not None
+    assert matched.group("value") == value
