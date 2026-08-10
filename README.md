@@ -1,8 +1,8 @@
-# 🍞 游戏商店喵喵喵 (Meow Game Shop)
+# 🍞 游戏商店 (Game Shop)
 
-MaiBot 游戏商店喵喵喵（Meow Game Shop）— 签到积分 + 商店道具 + 投喂Bot + 定时求投喂 + 小游戏。
+MaiBot 游戏商店（Game Shop）— 签到积分 + 商店道具 + 投喂Bot + 定时求投喂 + 小游戏。
 
-插件ID：`worldcopyist.meow-game-shop` ｜ 版本：`2.3.0`
+插件ID：`worldcopyist.game-shop` ｜ 版本：`2.3.0`
 
 支持全局/群内两层商店、群管理员授权、按群隔离数据，以及自定义商品饱食度和签到积分。
 游戏积分与商店积分共用余额，可下注游玩，支持每日获取上限与双排行榜。
@@ -208,7 +208,7 @@ MaiBot 游戏商店喵喵喵（Meow Game Shop）— 签到积分 + 商店道具 
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `enabled` | bool | `true` | 是否启用游戏商店喵喵喵 |
+| `enabled` | bool | `true` | 是否启用游戏商店 |
 | `config_version` | string | `"2.3.0"` | 配置版本号 |
 
 ### `[admin]` 管理员
@@ -377,7 +377,7 @@ uv run --project ../.. pytest -q --rootdir=../.. --import-mode=importlib tests
   - 整合小游戏：猜数字、骰子猜大小、石头剪刀布，积分与商店互通
   - 新增猜谜语小游戏：AI出题，5次机会，猜中奖励200积分
   - 新增每个游戏的参与积分与获得积分设置指令
-  - 插件更名为游戏商店喵喵喵（Meow Game Shop）
+  - 插件更名为游戏商店（Game Shop）
 
 ## 许可证
 
