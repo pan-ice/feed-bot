@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import re
 import time
-from typing import Any
 
 from maibot_sdk import Command
 
-from .config import FeedBotConfig
+from .config import FeedBotConfig, MAX_SIGN_BASE_POINTS
 from .db import AsyncDatabase
-from .utils import extract_nickname, is_likely_emoji
+from .utils import is_likely_emoji
+
+SET_SIGN_POINTS_COMMAND_PATTERN = r"^/投喂管理\s+签到积分(?:\s+(?P<value>.*))?$"
 
 
 class AdminCommandsMixin:
@@ -444,8 +447,8 @@ class AdminCommandsMixin:
 
     @Command(
         "admin_set_sign_points",
-        description="设置签到基础积分（管理员）",
-        pattern=r"^/投喂管理\s+签到积分\s+(?P<value>\d+)$",
+        description="设置全局签到基础积分（Bot管理员）",
+        pattern=SET_SIGN_POINTS_COMMAND_PATTERN,
     )
     async def handle_admin_set_sign_points(
         self,
@@ -454,12 +457,11 @@ class AdminCommandsMixin:
         group_id: str = "",
         **kwargs: Any,
     ) -> tuple[bool, str, bool]:
-        """处理 /投喂管理 签到积分 命令，设置每次签到获得的基础积分。"""
+        """处理 /投喂管理 签到积分 命令，设置全局签到基础积分。"""
         if group_id:
-            if not await self._is_group_admin(group_id, user_id):
-                await self.ctx.send.text("只有管理员才能执行此命令", stream_id)
-                return False, "非管理员", True
-        elif not self._is_bot_admin(user_id):
+            await self.ctx.send.text("Bot管理员命令请私聊Bot使用", stream_id)
+            return False, "非私聊", True
+        if not self._is_bot_admin(user_id):
             await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
             return False, "非管理员", True
 
@@ -478,9 +480,14 @@ class AdminCommandsMixin:
             await self.ctx.send.text("数值必须是整数", stream_id)
             return False, "数值格式错误", True
 
-        # 持久化到数据库，并同步内存配置
+        if not 0 <= value <= MAX_SIGN_BASE_POINTS:
+            await self.ctx.send.text(
+                f"签到基础积分必须在 0-{MAX_SIGN_BASE_POINTS:,} 之间", stream_id
+            )
+            return False, "数值超出范围", True
+
+        # 命令设置是独立于 config.toml 的全局持久化覆盖值
         await self.db.set_setting("sign_base_points", str(value))
-        self.config.sign.base_points = value
 
         await self.ctx.send.text(f"✅ 签到基础积分已设置为 {value}", stream_id)
         return True, f"设置签到积分{value}", True

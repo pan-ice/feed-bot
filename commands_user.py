@@ -11,7 +11,7 @@ import time
 
 from maibot_sdk import Command
 
-from .config import FeedBotConfig
+from .config import FeedBotConfig, MAX_SIGN_BASE_POINTS
 from .db import AsyncDatabase, _Rollback
 from .games import dice, guess_number, riddle, rps
 from .utils import extract_nickname
@@ -26,7 +26,7 @@ def parse_item_request(raw: str) -> tuple[str, int, str | None]:
         return "", 0, "缺少道具名"
 
     match = re.match(
-        r"^(?P<item_name>.+?)(?:\s+(?:[xX*×](?P<quantity>\S+)|(?P<plain_quantity>\d+)))?$",
+        r"^(?P<item_name>.+?)(?:\s+(?:[xX*×](?P<quantity>\S+)|(?P<plain_quantity>[+-]?(?:\d+(?:\.\d*)?|\.\d+))))?$",
         value,
     )
     if match is None:
@@ -87,14 +87,21 @@ class UserCommandsMixin:
 
         # 签到基础积分：优先使用管理员通过 /投喂管理 签到积分 设置的值
         sign_base_override = await self.db.get_setting("sign_base_points")
-        try:
-            sign_base = (
-                int(sign_base_override)
-                if sign_base_override is not None
-                else self.config.sign.base_points
-            )
-        except (TypeError, ValueError):
+        if sign_base_override is None:
             sign_base = self.config.sign.base_points
+        else:
+            try:
+                sign_base = int(sign_base_override)
+            except ValueError as error:
+                raise ValueError(
+                    "数据库设置 sign_base_points 不是整数："
+                    f"{sign_base_override!r}"
+                ) from error
+        if sign_base_override is not None and not 0 <= sign_base <= MAX_SIGN_BASE_POINTS:
+            raise ValueError(
+                "数据库设置 sign_base_points 超出允许范围："
+                f"{sign_base}，应在 0-{MAX_SIGN_BASE_POINTS} 之间"
+            )
 
         # 在事务中原子完成：读取签到状态 + 判断 + 更新，防止 TOCTOU
         def _sign_tx(cursor: Any) -> tuple[bool, int, int, int, int] | None:
@@ -842,17 +849,20 @@ class UserCommandsMixin:
             "📖 投喂规则",
             "以下指令所有成员均可使用：",
             "",
+            "通用指令：",
             "/签到 — 每日签到获取积分",
             "/积分 — 查看积分余额",
-            "/积分排行 — 查看本群积分排行",
             "/商店 — 查看可购买道具",
             f"/购买 <道具名> [x数量] — 购买道具，单次最多{MAX_BATCH_QUANTITY}个",
             "/背包 — 查看背包道具",
-            f"/投喂 <道具名> [x数量] — 投喂Bot，单次最多{MAX_BATCH_QUANTITY}个",
             "/投喂记录 — 查看投喂历史",
+            "/投喂规则 — 查看本规则",
+            "",
+            "群聊指令：",
+            "/积分排行 — 查看本群积分排行",
+            f"/投喂 <道具名> [x数量] — 投喂Bot，单次最多{MAX_BATCH_QUANTITY}个",
             "/饱食度 — 查看当前饱食度",
             "/投喂排行 — 查看本群投喂排行",
-            "/投喂规则 — 查看本规则",
             "",
             "🎮 小游戏（积分与商店互通）",
             "/游戏 — 查看游戏列表",

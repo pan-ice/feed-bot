@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import asyncio
 import logging
 import sqlite3
@@ -672,39 +674,45 @@ class AsyncDatabase:
 
     async def get_satiety(self, group_id: str, config: FeedBotConfig) -> float:
         """获取群饱食度（含衰减补偿，但不写回数据库）。如果群未初始化则自动创建记录。"""
-        row = await self.fetchone(
-            "SELECT satiety, last_decay_time FROM feed_groups WHERE group_id = ?",
-            (group_id,),
-        )
-        if row is None:
-            # 群未初始化饱食度，自动创建记录并写入初始值
-            initial = config.bot_attr.initial_satiety
+        def _get_satiety_tx(cursor: Any) -> float:
             now = time.time()
-            await self.execute_commit(
-                """
-                INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
-                VALUES (?, 1, ?, 0, ?, ?)
-                """,
-                (group_id, initial, now, now),
+            cursor.execute(
+                "SELECT satiety, last_decay_time FROM feed_groups WHERE group_id = ?",
+                (group_id,),
             )
-            return initial
+            row = cursor.fetchone()
+            if row is None:
+                # 群未初始化饱食度，自动创建记录并写入初始值
+                initial = config.bot_attr.initial_satiety
+                cursor.execute(
+                    """
+                    INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
+                    VALUES (?, 1, ?, 0, ?, ?)
+                    """,
+                    (group_id, initial, now, now),
+                )
+                return initial
 
-        satiety, last_decay_time = row[0], row[1]
-        # 记录存在但饱食度未初始化（如仅配置了群管理员时写入的 -1），
-        # 回退为初始饱食度并写回，避免 /饱食度 显示异常值
-        if satiety < 0:
-            initial = config.bot_attr.initial_satiety
-            now = time.time()
-            await self.execute_commit(
-                "UPDATE feed_groups SET satiety = ?, last_decay_time = ? WHERE group_id = ?",
-                (initial, now, group_id),
-            )
-            return initial
-        # 补偿衰减（仅计算，不写回——写回由衰减循环统一负责）
-        if last_decay_time > 0:
-            hours_elapsed = (time.time() - last_decay_time) / 3600.0
-            satiety = max(0.0, satiety - hours_elapsed * config.bot_attr.satiety_decay_rate)
-        return satiety
+            satiety, last_decay_time = row[0], row[1]
+            if satiety < 0:
+                # 群记录可能仅用于保存管理员，此时在同一事务内初始化饱食度，避免覆盖并发设置
+                initial = config.bot_attr.initial_satiety
+                cursor.execute(
+                    "UPDATE feed_groups SET satiety = ?, last_decay_time = ? WHERE group_id = ?",
+                    (initial, now, group_id),
+                )
+                return initial
+
+            # 补偿衰减（仅计算，不写回；写回由衰减循环统一负责）
+            if last_decay_time > 0:
+                hours_elapsed = (now - last_decay_time) / 3600.0
+                satiety = max(
+                    0.0,
+                    satiety - hours_elapsed * config.bot_attr.satiety_decay_rate,
+                )
+            return satiety
+
+        return await self.run_in_transaction(_get_satiety_tx)
 
     async def set_satiety(self, value: float, group_id: str) -> None:
         """设置群饱食度（钳位到 0-100）。"""

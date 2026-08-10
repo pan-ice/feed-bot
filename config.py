@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from maibot_sdk import Field, PluginConfigBase
 
+# 限制持久化覆盖值，避免超大整数在 SQLite 积分运算中溢出。
+MAX_SIGN_BASE_POINTS = 1_000_000
+
 
 class PluginSectionConfig(PluginConfigBase):
     """插件基础配置。"""
