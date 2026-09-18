@@ -13,6 +13,8 @@ import time
 from .config import FeedBotConfig
 from .utils import DB_PATH
 
+_GROUP_ENABLED_MIGRATION_KEY = "group_enabled_authorization_v1"
+
 
 class _Rollback(Exception):
     """用于在 run_in_transaction 中安全回滚事务的信号异常。
@@ -321,12 +323,71 @@ class AsyncDatabase:
             pass  # 列已存在
 
         # 迁移：添加 group_admin_users 列（群管理员持久化，替代 config.toml 写入）
-        try:
+        feed_group_columns = {
+            row[1] for row in self._db.execute("PRAGMA table_info(feed_groups)").fetchall()
+        }
+        if "group_admin_users" not in feed_group_columns:
             self._db.execute(
                 "ALTER TABLE feed_groups ADD COLUMN group_admin_users TEXT NOT NULL DEFAULT ''"
             )
-        except sqlite3.OperationalError:
-            pass  # 列已存在
+            # 从旧版本直接升级时，在同一事务中补齐已有群的初始管理员。
+            for item in self.config.filter.group_admins:
+                gid = item.gid()
+                admins = item.admin_list()
+                if not gid or not admins:
+                    continue
+                self._db.execute(
+                    "UPDATE feed_groups SET group_admin_users = ? WHERE group_id = ?",
+                    (self._serialize_admin_list(admins), gid),
+                )
+
+        self._migrate_group_enabled_authorization()
+
+    def _migrate_group_enabled_authorization(self) -> None:
+        """一次性将旧版 enabled 占位值迁移为真实群授权状态。"""
+        assert self._db is not None
+        migrated = self._db.execute(
+            "SELECT 1 FROM plugin_settings WHERE key = ?",
+            (_GROUP_ENABLED_MIGRATION_KEY,),
+        ).fetchone()
+        if migrated is not None:
+            return
+
+        # 旧版本的普通群数据也会写 enabled=1，不能直接视为已经授权。
+        self._db.execute(
+            """
+            UPDATE feed_groups
+            SET enabled = CASE
+                WHEN TRIM(group_admin_users) != '' THEN 1
+                ELSE 0
+            END
+            """
+        )
+        for item in self.config.filter.group_admins:
+            gid = item.gid()
+            if gid:
+                config_admins = item.admin_list()
+                self._db.execute(
+                    """
+                    UPDATE feed_groups
+                    SET enabled = 1,
+                        group_admin_users = CASE
+                            WHEN TRIM(group_admin_users) = '' AND ? != '' THEN ?
+                            ELSE group_admin_users
+                        END
+                    WHERE group_id = ?
+                    """,
+                    (
+                        self._serialize_admin_list(config_admins),
+                        self._serialize_admin_list(config_admins),
+                        gid,
+                    ),
+                )
+
+        self._db.execute(
+            "INSERT INTO plugin_settings (key, value) VALUES (?, '1')",
+            (_GROUP_ENABLED_MIGRATION_KEY,),
+        )
 
     def _migrate_per_group_data(self) -> None:
         """将旧的无群号前缀的用户数据迁移为带群号前缀的格式。"""
@@ -513,7 +574,7 @@ class AsyncDatabase:
                 cursor.execute(
                     """
                     INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
-                    VALUES (?, 1, ?, 0, ?, ?)
+                    VALUES (?, 0, ?, 0, ?, ?)
                     """,
                     (group_id, initial, now, now),
                 )
@@ -547,7 +608,7 @@ class AsyncDatabase:
         await self.execute_commit(
             """
             INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
-            VALUES (?, 1, ?, 0, ?, ?)
+            VALUES (?, 0, ?, 0, ?, ?)
             ON CONFLICT(group_id) DO UPDATE SET satiety = ?, last_decay_time = ?
             """,
             (group_id, value, now, now, value, now),
@@ -623,6 +684,13 @@ class AsyncDatabase:
             return []
         return self._parse_admin_str(row[0])
 
+    async def get_enabled_group_ids(self) -> set[str]:
+        """获取数据库中已启用的群号。"""
+        rows = await self.execute(
+            "SELECT group_id FROM feed_groups WHERE enabled = 1 AND group_id != ''"
+        )
+        return {str(row[0]) for row in rows}
+
     async def set_group_admins(self, group_id: str, admins: list[str]) -> None:
         """设置群的管理员列表（覆盖写入）。若群记录不存在则创建。"""
         raw = self._serialize_admin_list(admins)
@@ -631,7 +699,7 @@ class AsyncDatabase:
             """
             INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, group_admin_users, created_at)
             VALUES (?, 1, -1, 0, 0, ?, ?)
-            ON CONFLICT(group_id) DO UPDATE SET group_admin_users = ?
+            ON CONFLICT(group_id) DO UPDATE SET enabled = 1, group_admin_users = ?
             """,
             (group_id, raw, now, raw),
         )
@@ -650,12 +718,11 @@ class AsyncDatabase:
             admins.remove(user_id)
             await self.set_group_admins(group_id, admins)
 
-    async def sync_group_admins_from_config(self, config: FeedBotConfig) -> None:
-        """将 config.toml 中的 group_admins 同步到数据库。
+    async def initialize_group_admins_from_config(self, config: FeedBotConfig) -> None:
+        """使用 config.toml 初始化数据库中尚不存在的授权群。
 
-        对每个已配置的群，将 config 中的管理员列表写入 feed_groups.group_admin_users。
-        仅在群记录的 group_admin_users 为空时才写入（避免覆盖运行时 /授权 的变更），
-        除非 config 中有值（WebUI 主动修改时覆盖同步）。
+        数据库是运行时授权的唯一来源。配置只负责初始化新群，不能覆盖
+        已经通过授权或取消授权指令修改过的群管理员列表。
         """
         for item in config.filter.group_admins:
             gid = item.gid()
@@ -664,15 +731,10 @@ class AsyncDatabase:
 
             config_admins = item.admin_list()
 
-            # 确保群记录存在
+            # 仅初始化尚未授权的群，避免覆盖指令维护的管理员列表。
             row = await self.fetchone(
-                "SELECT group_admin_users FROM feed_groups WHERE group_id = ?",
+                "SELECT enabled FROM feed_groups WHERE group_id = ?",
                 (gid,),
             )
-            if row is None:
-                # 群记录不存在，创建并写入管理员
+            if row is None or not row[0]:
                 await self.set_group_admins(gid, config_admins)
-            elif config_admins:
-                # config 有值，覆盖同步（WebUI 修改时触发 on_config_update）
-                await self.set_group_admins(gid, config_admins)
-            # 若 config_admins 为空且数据库已有值，保留数据库值（不覆盖 /授权 结果）

@@ -22,6 +22,7 @@ class AdminCommandsMixin:
     # 这些属性由 FeedBotPlugin 提供，类型标注仅供静态分析
     db: AsyncDatabase
     config: FeedBotConfig
+    _enabled_groups: set[str]
 
     # ---- 权限与过滤 ----
 
@@ -37,54 +38,18 @@ class AdminCommandsMixin:
         return user_id in admins
 
     def _enabled_group_ids(self) -> set[str]:
-        """返回配置中授权的所有群号。"""
-        result: set[str] = set()
-        for item in self.config.filter.group_admins:
-            gid = item.gid()
-            if gid:
-                result.add(gid)
-        return result
+        """返回从数据库恢复的已启用群号。"""
+        return set(self._enabled_groups)
 
     def _is_group_enabled(self, group_id: str) -> bool:
-        """判断群是否在配置中授权。"""
-        return group_id in self._enabled_group_ids()
+        """判断群是否已在数据库中启用。"""
+        return group_id in self._enabled_groups
 
     def _check_group_enabled(self, group_id: str) -> bool:
         """群聊时检查群是否授权，私聊时放行。未授权群静默忽略。"""
         if group_id and not self._is_group_enabled(group_id):
             return False
         return True
-
-    # ---- 内存配置同步（运行时授权不写 config.toml，参照 bilibili 插件模式） ----
-
-    def _add_group_admin_to_memory(self, target_group_id: str, target_user: str) -> None:
-        """在内存配置中添加群管理员（供 _enabled_group_ids 使用，不写文件）。
-
-        运行时授权数据持久化到数据库，config.toml 仅作为初始配置源。
-        WebUI 用户修改 config.toml 后通过 on_config_update 同步到数据库。
-        命令用户通过 /投喂管理 群列表 查看运行时授权。
-        """
-        from .config import GroupAdminEntry
-        admins = self.config.filter.group_admins
-        for item in admins:
-            if item.gid() == target_group_id:
-                existing = item.admin_list()
-                if target_user not in existing:
-                    existing.append(target_user)
-                    item.admin_users = AsyncDatabase._serialize_admin_list(existing)
-                return
-        admins.append(GroupAdminEntry(group_id=target_group_id, admin_users=target_user))
-
-    def _remove_group_admin_from_memory(self, target_group_id: str, target_user: str) -> None:
-        """在内存配置中移除群管理员（不写文件）。"""
-        admins = self.config.filter.group_admins
-        for item in admins:
-            if item.gid() == target_group_id:
-                existing = item.admin_list()
-                if target_user in existing:
-                    existing.remove(target_user)
-                    item.admin_users = AsyncDatabase._serialize_admin_list(existing)
-                return
 
     # ---- 道具参数解析 ----
 
@@ -530,8 +495,7 @@ class AdminCommandsMixin:
 
         # 写入数据库（运行时授权）
         await self.db.add_group_admin(target_group_id, target_user)
-        # 同步更新内存配置（供 _enabled_group_ids 使用）
-        self._add_group_admin_to_memory(target_group_id, target_user)
+        self._enabled_groups.add(target_group_id)
 
         await self.ctx.send.text(
             f"✅ 已授权 {target_user} 为群 {target_group_id} 的管理员", stream_id
@@ -581,8 +545,6 @@ class AdminCommandsMixin:
 
         # 从数据库移除（运行时授权）
         await self.db.remove_group_admin(target_group_id, target_user)
-        # 同步更新内存配置
-        self._remove_group_admin_from_memory(target_group_id, target_user)
 
         await self.ctx.send.text(
             f"✅ 已取消 {target_user} 在群 {target_group_id} 的管理员权限", stream_id
@@ -612,7 +574,7 @@ class AdminCommandsMixin:
             await self.ctx.send.text("只有Bot管理员才能执行此命令", stream_id)
             return False, "非管理员", True
 
-        # 从配置获取已启用的群列表
+        # 从数据库获取已启用的群列表
         enabled_groups = self._enabled_group_ids()
         if not enabled_groups:
             await self.ctx.send.text("暂无已授权的群", stream_id)

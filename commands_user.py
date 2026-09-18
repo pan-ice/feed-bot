@@ -598,7 +598,7 @@ class UserCommandsMixin:
             cursor.execute(
                 """
                 INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, last_decay_time, created_at)
-                VALUES (?, 1, ?, 0, ?, ?)
+                VALUES (?, 0, ?, 0, ?, ?)
                 ON CONFLICT(group_id) DO UPDATE SET satiety = ?, last_decay_time = ?
                 """,
                 (group_id, new_satiety, now_ts, now_ts, new_satiety, now_ts),

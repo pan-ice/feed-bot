@@ -16,7 +16,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用投喂插件")
-    config_version: str = Field(default="1.1.1", description="配置版本")
+    config_version: str = Field(default="1.3.0", description="配置版本")
 
 
 class AdminConfig(PluginConfigBase):
@@ -117,7 +117,7 @@ class FilterConfig(PluginConfigBase):
 
     group_admins: list[GroupAdminEntry] = Field(
         default_factory=list,
-        description="授权群配置，每项包含群号和管理员QQ。只有在列表中的群才会响应命令",
+        description="授权群初始配置，每项包含群号和管理员QQ。已初始化群以数据库授权为准",
     )
 
 

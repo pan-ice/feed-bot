@@ -137,7 +137,7 @@ MaiBot 投喂插件 — 签到积分 + 商店道具 + 投喂Bot + 定时求投�
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `enabled` | bool | `true` | 是否启用投喂插件 |
-| `config_version` | string | `"1.1.1"` | 配置版本号 |
+| `config_version` | string | `"1.3.0"` | 配置版本号，与插件版本保持一致 |
 
 ### `[admin]` 管理员
 
@@ -179,7 +179,7 @@ admin_users = ["123456789", "987654321"]
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `group_admins` | list[GroupAdminEntry] | `[]` | 授权群配置。**只有在列表中的群才会响应命令**，未配置的群静默忽略。运行时可通过 `/投喂管理 授权` 追加管理员，通过 `/投喂管理 群列表` 查看。 |
+| `group_admins` | list[GroupAdminEntry] | `[]` | 授权群初始配置。首次出现的群会写入数据库；已初始化群以数据库中的授权为准，配置热重载不会覆盖指令授权。运行时可通过 `/投喂管理 授权` 追加管理员，通过 `/投喂管理 群列表` 查看。 |
 
 每个 `GroupAdminEntry` 包含：
 
@@ -203,7 +203,7 @@ admin_users = "333 | 444"
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `enabled` | bool | `true` | 是否使用LLM生成投喂回复（关闭则使用 `fallback_reply`） |
-| `model` | string | `"replyer"` | LLM模型名，留空使用MaiBot的replyer模型 |
+| `model` | string | `"replyer"` | LLM任务名，留空使用 MaiBot 的 `replyer` 任务 |
 | `temperature` | float | `0.8` | 生成温度，越高越随机（0.0-2.0） |
 | `max_tokens` | int | `300` | 单次回复最大token数（含reasoning token） |
 | `fallback_reply` | string | `"谢谢你投喂我！好开心~"` | LLM不可用时的兜底回复 |
@@ -212,6 +212,7 @@ admin_users = "333 | 444"
 
 - 所有数据保存在插件目录的 `data/feed_bot.db`（SQLite，自动创建）
 - 用户积分、签到、背包、投喂记录、群管理员授权、签到积分设置均存储在数据库中
+- 群管理员授权和取消授权会跨插件重载与 MaiBot 重启保留；`config.toml` 仅初始化数据库中尚不存在的群
 - 按群隔离：群号前缀区分不同群的用户数据
 
 ## 安装
@@ -250,6 +251,9 @@ uv run --project ../.. pytest -q --rootdir=../.. --import-mode=importlib tests
 | `utils.py` | 工具函数与路径常量 |
 
 ## 更新记录
+
+- **2026-08-27**：
+  - 修复指令授权的群管理员在插件重载或配置热更新后失效的问题
 
 - **2026-08-05**：
   - `/商店` 展示时每个商品之间隔一行，便于查看

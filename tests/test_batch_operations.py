@@ -2,7 +2,9 @@ from importlib import util
 from pathlib import Path
 from typing import Any
 
+import json
 import re
+import sqlite3
 import sys
 import time
 
@@ -37,6 +39,7 @@ db_module = __import__(f"{PACKAGE_NAME}.db", fromlist=["*"])
 AdminCommandsMixin = commands_admin.AdminCommandsMixin
 AsyncDatabase = db_module.AsyncDatabase
 FeedBotConfig = config_module.FeedBotConfig
+GroupAdminEntry = config_module.GroupAdminEntry
 MAX_SIGN_BASE_POINTS = config_module.MAX_SIGN_BASE_POINTS
 SET_SIGN_POINTS_COMMAND_PATTERN = commands_admin.SET_SIGN_POINTS_COMMAND_PATTERN
 UserCommandsMixin = commands_user.UserCommandsMixin
@@ -62,6 +65,7 @@ class PluginHarness(UserCommandsMixin, AdminCommandsMixin):
         self.config = FeedBotConfig()
         self.config.admin.admin_users = ["bot-admin"]
         self.ctx = FakeContext()
+        self._enabled_groups: set[str] = set()
 
     def _check_group_enabled(self, group_id: str) -> bool:
         return True
@@ -351,6 +355,133 @@ async def test_get_satiety_initializes_admin_only_group(plugin: PluginHarness) -
 
 
 @pytest.mark.asyncio
+async def test_command_grant_survives_database_reopen_with_empty_config(
+    plugin: PluginHarness,
+) -> None:
+    result = await plugin.handle_admin_grant(
+        stream_id="stream",
+        user_id="bot-admin",
+        matched_groups={"group_id": "new-group", "target_user": "group-admin"},
+    )
+
+    assert result == (True, "授权群管理员group-admin", True)
+    assert plugin._is_group_enabled("new-group")
+
+    plugin._enabled_groups.clear()
+    plugin.db.close()
+    plugin.db.open()
+    await plugin.db.initialize_group_admins_from_config(FeedBotConfig())
+    plugin._enabled_groups = await plugin.db.get_enabled_group_ids()
+
+    assert plugin._is_group_enabled("new-group")
+    assert await plugin.db.get_group_admins("new-group") == ["group-admin"]
+
+    plugin.ctx.send.messages.clear()
+    list_result = await plugin.handle_admin_list_groups(
+        stream_id="stream",
+        user_id="bot-admin",
+    )
+    assert list_result == (True, "群列表", True)
+    assert "群 new-group：group-admin" in plugin.ctx.send.messages[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_config_reload_does_not_overwrite_command_authorization(
+    plugin: PluginHarness,
+) -> None:
+    initial_config = FeedBotConfig()
+    initial_config.filter.group_admins = [
+        GroupAdminEntry(group_id="group", admin_users="configured-admin")
+    ]
+    await plugin.db.initialize_group_admins_from_config(initial_config)
+    plugin._enabled_groups = await plugin.db.get_enabled_group_ids()
+
+    await plugin.handle_admin_grant(
+        stream_id="stream",
+        user_id="bot-admin",
+        matched_groups={"group_id": "group", "target_user": "runtime-admin"},
+    )
+    await plugin.handle_admin_revoke(
+        stream_id="stream",
+        user_id="bot-admin",
+        matched_groups={"group_id": "group", "target_user": "configured-admin"},
+    )
+
+    plugin.db.close()
+    plugin.db.open()
+    await plugin.db.initialize_group_admins_from_config(initial_config)
+    plugin._enabled_groups = await plugin.db.get_enabled_group_ids()
+
+    assert plugin._is_group_enabled("group")
+    assert await plugin.db.get_group_admins("group") == ["runtime-admin"]
+
+
+@pytest.mark.asyncio
+async def test_satiety_data_does_not_enable_unapproved_group(
+    plugin: PluginHarness,
+) -> None:
+    await plugin.db.set_satiety(50, "data-only-group")
+    plugin._enabled_groups = await plugin.db.get_enabled_group_ids()
+
+    assert not plugin._is_group_enabled("data-only-group")
+
+    config = FeedBotConfig()
+    config.filter.group_admins = [
+        GroupAdminEntry(group_id="data-only-group", admin_users="group-admin")
+    ]
+    await plugin.db.initialize_group_admins_from_config(config)
+    plugin._enabled_groups = await plugin.db.get_enabled_group_ids()
+
+    assert plugin._is_group_enabled("data-only-group")
+    assert await plugin.db.get_group_admins("data-only-group") == ["group-admin"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_group_receives_configured_admin_during_schema_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "legacy_feed_bot.db"
+    legacy_db = sqlite3.connect(db_path)
+    legacy_db.execute(
+        """
+        CREATE TABLE feed_groups (
+            group_id TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            satiety REAL NOT NULL DEFAULT -1,
+            last_seek_feed_time REAL NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    legacy_db.execute(
+        "INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, created_at) "
+        "VALUES ('legacy-group', 1, 50, 0, ?)",
+        (time.time(),),
+    )
+    legacy_db.execute(
+        "INSERT INTO feed_groups (group_id, enabled, satiety, last_seek_feed_time, created_at) "
+        "VALUES ('data-only-group', 1, 50, 0, ?)",
+        (time.time(),),
+    )
+    legacy_db.commit()
+    legacy_db.close()
+
+    monkeypatch.setattr(db_module, "DB_PATH", str(db_path))
+    config = FeedBotConfig()
+    config.filter.group_admins = [
+        GroupAdminEntry(group_id="legacy-group", admin_users="configured-admin")
+    ]
+    database = AsyncDatabase(config)
+    database.open()
+    try:
+        assert await database.get_group_admins("legacy-group") == ["configured-admin"]
+        assert await database.get_enabled_group_ids() == {"legacy-group"}
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
 async def test_feed_rules_separates_group_only_commands(plugin: PluginHarness) -> None:
     result = await plugin.handle_feed_rules(
         stream_id="stream", user_id="user", group_id=""
@@ -368,6 +499,13 @@ def test_bot_attr_schema_uses_bilingual_labels() -> None:
 
     assert fields["initial_satiety"]["label"] == "初始饱食度（initial_satiety）"
     assert fields["seek_feed_messages"]["label"] == "求投喂消息（seek_feed_messages）"
+
+
+def test_plugin_and_config_versions_are_synchronized() -> None:
+    manifest = json.loads((PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8"))
+
+    assert manifest["version"] == "1.3.0"
+    assert FeedBotConfig().plugin.config_version == manifest["version"]
 
 
 @pytest.mark.parametrize(

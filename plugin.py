@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
+
+import asyncio
 
 from maibot_sdk import MaiBotPlugin
 
@@ -31,6 +32,7 @@ class FeedBotPlugin(
         self._running: bool = False
         self._decay_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._seek_feed_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._enabled_groups: set[str] = set()
 
     # ---- 生命周期 ----
 
@@ -43,8 +45,9 @@ class FeedBotPlugin(
         self.db.config = self.config
         await asyncio.to_thread(self.db.open)
 
-        # 将 config.toml 中的群管理员同步到数据库
-        await self.db.sync_group_admins_from_config(self.config)
+        # 配置只初始化新群，运行时群授权从数据库恢复
+        await self.db.initialize_group_admins_from_config(self.config)
+        self._enabled_groups = await self.db.get_enabled_group_ids()
 
         self._running = True
         self._decay_task = asyncio.create_task(self._attr_decay_loop())
@@ -80,12 +83,13 @@ class FeedBotPlugin(
     async def on_config_update(
         self, scope: str, config_data: dict[str, Any], version: str
     ) -> None:
-        """配置热重载时重启后台任务并同步群管理员到数据库。"""
+        """配置热重载时重启后台任务并初始化新增授权群。"""
         if scope != "self":
             return
 
-        # 同步 WebUI / config.toml 中的群管理员变更到数据库
-        await self.db.sync_group_admins_from_config(self.config)
+        # 配置只初始化新增群，不能覆盖数据库中的运行时授权
+        await self.db.initialize_group_admins_from_config(self.config)
+        self._enabled_groups = await self.db.get_enabled_group_ids()
 
         self.ctx.logger.info(f"投喂插件配置已更新 (v{version})，重启后台任务")
 
