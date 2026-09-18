@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import random
 import re
 import time
@@ -79,6 +80,27 @@ class LoopTasksMixin:
             return start <= current < end
         # 跨午夜，如 23:00-08:00
         return current >= start or current < end
+
+    async def _generate_llm(
+        self,
+        prompt: str,
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        """按 SDK 版本传递任务配置名，兼容旧版任务路由。"""
+        generate_parameters = inspect.signature(self.ctx.llm.generate).parameters
+        request_kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if "task_name" in generate_parameters:
+            request_kwargs["task_name"] = self.config.llm.effective_model
+        else:
+            # 2.0.0-2.8.0 的 SDK 将 model 作为任务名传给旧版 Host。
+            request_kwargs["model"] = self.config.llm.effective_model
+        return await self.ctx.llm.generate(**request_kwargs)
 
     # ---- 定时任务 ----
 
@@ -163,9 +185,8 @@ class LoopTasksMixin:
                                             seek_prompt_parts.append(f"你的表达风格：{reply_style}")
                                     except Exception:
                                         pass
-                                    llm_result = await self.ctx.llm.generate(
+                                    llm_result = await self._generate_llm(
                                         prompt="\n".join(seek_prompt_parts),
-                                        model=self.config.llm.effective_model,
                                         temperature=0.9,
                                         max_tokens=300,
                                     )
@@ -261,9 +282,8 @@ class LoopTasksMixin:
         prompt = "\n".join(prompt_parts)
 
         try:
-            result = await self.ctx.llm.generate(
+            result = await self._generate_llm(
                 prompt=prompt,
-                model=self.config.llm.effective_model,
                 temperature=self.config.llm.temperature,
                 max_tokens=self.config.llm.max_tokens,
             )
